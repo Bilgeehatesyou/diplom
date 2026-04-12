@@ -1,0 +1,13 @@
+.venv/
+backend/.venv/
+__pycache__/
+*.pyc
+node_modules/
+apps/student/node_modules/
+.next/
+apps/student/.next/
+.env
+dist/
+build/
+aiproctor.db
+yolov8n.pt
