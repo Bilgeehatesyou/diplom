@@ -7,7 +7,7 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      - DATABASE_URL=postgresql://postgres:secret@db:5432/aiproctor
+      - DATABASE_URL=sqlite+aiosqlite:///./aiproctor.db
     depends_on:
       - db
 
