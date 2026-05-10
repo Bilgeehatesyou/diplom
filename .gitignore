@@ -11,3 +11,5 @@ dist/
 build/
 aiproctor.db
 yolov8n.pt
+data/
+models/

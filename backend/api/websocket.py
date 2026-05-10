@@ -1,20 +1,61 @@
-import asyncio, json
+import asyncio, json, uuid
 from datetime import datetime
-import cv2, numpy as np
+import cv2, numpy as np, io
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, update
 from db import AsyncSessionLocal, RiskEvent, ExamSession
-from ai.analyzer import analyze_frame, DetectionEvent
+from ai.analyzer import analyze_frame, analyze_audio_samples, DetectionEvent
 
 router      = APIRouter()
 _conns      : dict[str, WebSocket] = {}
 _ctx        : dict[str, dict]      = {}
+
+# Audio buffer: student_id → list of raw bytes chunks
+_audio_bufs : dict[str, list]    = {}
+_AUDIO_SAMPLE_RATE = 16000
+_AUDIO_CHUNK_SEC   = 3    # seconds per analysis window
+
+
+async def _process_audio(student_id: str):
+    """Accumulated audio буферт хуримтлуулж, analyze_audio_samples дуудах."""
+    buf = _audio_bufs.get(student_id, [])
+    if len(buf) < 2:
+        return
+    raw = b"".join(buf)
+    _audio_bufs[student_id] = []
+
+    try:
+        import wave, io as _io
+        from pydub import AudioSegment
+
+        # pydub handles webm/opus → raw PCM 16kHz mono
+        audio = AudioSegment.from_file(_io.BytesIO(raw), format="webm")
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        raw_pcm = audio.raw_data
+        audio_arr = np.frombuffer(raw_pcm, np.int16).astype(np.float32) / 32768.0
+        sr = 16000
+    except Exception as e:
+        print(f"[AUDIO] Декод алдаа: {e}")
+        return
+
+    events = await asyncio.to_thread(
+        analyze_audio_samples, audio_arr, sr, _ctx[student_id]
+    )
+    for ev in events:
+        d = ev.to_dict()
+        ws = _conns.get(student_id)
+        if ws:
+            await _safe_send(ws, d)
+        await _log(student_id, "exam_001", ev, _ctx[student_id].get("frame_no", 0))
+        await _to_teacher(student_id, d)
+
 
 @router.websocket("/ws/student/{student_id}")
 async def student_ws(websocket: WebSocket, student_id: str, exam_id: str = "exam_001"):
     await websocket.accept()
     _conns[student_id] = websocket
     _ctx[student_id]   = {"frame_no": 0, "face_miss_count": 0, "gaze_away_count": 0}
+    _audio_bufs[student_id] = []
     print(f"[WS] ✓ Оюутан: {student_id}")
 
     async with AsyncSessionLocal() as db:
@@ -23,25 +64,18 @@ async def student_ws(websocket: WebSocket, student_id: str, exam_id: str = "exam
         await db.commit()
         sess_id = sess.id
 
+    audio_task = None
     try:
         while True:
             data = await websocket.receive()
 
-            if "bytes" in data and data["bytes"]:
-                arr   = np.frombuffer(data["bytes"], np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is None: continue
-                events = await asyncio.to_thread(analyze_frame, frame, _ctx[student_id])
-                for ev in events:
-                    d = ev.to_dict()
-                    await _safe_send(websocket, d)
-                    await _log(student_id, exam_id, ev, _ctx[student_id].get("frame_no",0))
-                    await _to_teacher(student_id, d)
-
-            elif "text" in data and data["text"]:
+            if "text" in data and data["text"]:
                 try:
                     msg = json.loads(data["text"])
                 except: continue
+                if msg.get("_audio"):
+                    _ctx[student_id]["_awaiting_audio"] = True
+                    continue
                 etype = msg.get("event")
                 if etype in ("tab_switch","fullscreen_exit","copy_attempt"):
                     labels = {"tab_switch":"Цонх солигдсон","fullscreen_exit":"Fullscreen-ээс гарсан","copy_attempt":"Хуулах оролдлого"}
@@ -52,10 +86,32 @@ async def student_ws(websocket: WebSocket, student_id: str, exam_id: str = "exam
                     await _log(student_id, exam_id, ev, _ctx[student_id].get("frame_no",0))
                     await _to_teacher(student_id, d)
 
+            elif "bytes" in data and data["bytes"]:
+                if _ctx[student_id].pop("_awaiting_audio", False):
+                    # Audio data
+                    _audio_bufs[student_id].append(data["bytes"])
+                    total_bytes = sum(len(c) for c in _audio_bufs[student_id])
+                    expected_bytes = _AUDIO_SAMPLE_RATE * 2 * _AUDIO_CHUNK_SEC
+                    if total_bytes >= expected_bytes:
+                        await _process_audio(student_id)
+                    continue
+
+                # Video frame
+                arr   = np.frombuffer(data["bytes"], np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is None: continue
+                events = await asyncio.to_thread(analyze_frame, frame, _ctx[student_id])
+                for ev in events:
+                    d = ev.to_dict()
+                    await _safe_send(websocket, d)
+                    await _log(student_id, exam_id, ev, _ctx[student_id].get("frame_no",0))
+                    await _to_teacher(student_id, d)
+
     except WebSocketDisconnect:
         print(f"[WS] Оюутан салсан: {student_id}")
     finally:
         _conns.pop(student_id, None)
+        _audio_bufs.pop(student_id, None)
         async with AsyncSessionLocal() as db:
             await db.execute(update(ExamSession).where(ExamSession.id==sess_id).values(ended_at=datetime.now()))
             await db.commit()

@@ -46,6 +46,8 @@ export default function ExamPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'))
   const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const audioIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
 
   const [timeLeft, setTimeLeft] = useState(50 * 60)
   const [warning, setWarning] = useState<string | null>(null)
@@ -56,7 +58,7 @@ export default function ExamPage() {
 
   // Initialize camera and WebSocket
   useEffect(() => {
-    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false })
+    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: true })
       .then(stream => {
         streamRef.current = stream
         if (videoRef.current) videoRef.current.srcObject = stream
@@ -64,10 +66,43 @@ export default function ExamPage() {
       })
       .catch(() => router.push('/'))
 
+    // Start audio recording (MediaRecorder)
+    const startAudio = () => {
+      if (!streamRef.current) return
+      const audioTracks = streamRef.current.getAudioTracks()
+      if (!audioTracks.length) return
+
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : 'audio/opus'
+
+      const recorder = new MediaRecorder(streamRef.current, { mimeType })
+      mediaRecorderRef.current = recorder
+
+      recorder.ondataavailable = async (e) => {
+        if (e.data && wsRef.current?.readyState === WebSocket.OPEN) {
+          // Send marker so backend knows next bytes are audio
+          wsRef.current.send(JSON.stringify({ _audio: true }))
+          const blob = await e.data.arrayBuffer()
+          wsRef.current.send(blob)
+        }
+      }
+
+      // Send audio every 2 seconds
+      recorder.start(2000)
+      audioIntervalRef.current = setInterval(() => {
+        if (recorder.state === 'recording') recorder.requestData()
+      }, 2000)
+    }
+
+    startAudio()
+
     return () => {
       streamRef.current?.getTracks().forEach(t => t.stop())
       wsRef.current?.close()
       if (frameIntervalRef.current) clearInterval(frameIntervalRef.current)
+      if (audioIntervalRef.current) clearInterval(audioIntervalRef.current)
+      if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop()
     }
   }, [])
 

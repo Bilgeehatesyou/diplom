@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ffmpeg -version)",
+      "Bash(file data/commonvoice25/mn/clips/*.mp3)",
+      "Bash(python *)",
+      "Bash(where python *)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/users/**)",
+      "Bash(C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe *)",
+      "Bash(chcp 65001)",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe\" scripts/prepare_commonvoice.py)",
+      "Bash(PYTHONIOENCODING=utf-8 C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe *)",
+      "Bash(Select-Object -First 10)",
+      "Bash(bash scripts/download_commonvoice.sh)",
+      "Bash(curl -sI \"https://commonvoice.mozilla.org/datasets/cv-corpus-25.0-2026-03-09-mn.tgz\")",
+      "Bash(curl -sI -L \"https://commonvoice.mozilla.org/datasets/cv-corpus-25.0-2026-03-09-mn.tgz\")",
+      "Bash(curl -s \"https://commonvoice.mozilla.org/api/datasets?short=false\")",
+      "Bash(py scripts/prepare_commonvoice.py)",
+      "PowerShell(py *)",
+      "Bash(py -c \"import torch; print\\('CUDA available:', torch.cuda.is_available\\(\\)\\); print\\('GPU:', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else 'None'\\)\")",
+      "Bash(pip install *)",
+      "Bash(Move-Item *)",
+      "PowerShell(Copy-Item *)",
+      "Bash(wmic logicaldisk *)"
+    ]
+  }
+}
