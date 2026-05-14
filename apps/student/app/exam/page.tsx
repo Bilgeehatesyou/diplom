@@ -196,7 +196,7 @@ export default function ExamPage() {
       const canvas = canvasRef.current
       canvas.width = video.videoWidth || 640
       canvas.height = video.videoHeight || 480
-      canvas.getContext('2d')?.drawImage(video, 0, 0)
+      canvas.getContext('2d')?.drawImage(video, 0, 0,)
       canvas.toBlob(blob => {
         if (blob && wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(blob)
@@ -262,24 +262,24 @@ export default function ExamPage() {
   const answeredCount = Object.keys(answers).length
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50">
+    <div className="flex flex-col min-h-screen bg-slate-50">
 
       {/* ── Fixed Warning Banner ── */}
       {warning && (
-        <div className="fixed top-0 left-0 right-0 z-50 bg-red-50 border-b-2 border-red-300 px-5 py-3 flex items-center gap-3 shadow-md">
-          <span className="text-red-600 text-lg font-bold">⚠</span>
-          <span className="text-sm text-red-700 font-medium">{warning}</span>
+        <div className="fixed top-0 left-0 right-0 z-50 flex items-center gap-3 px-5 py-3 border-b-2 border-red-300 shadow-md bg-red-50">
+          <span className="text-lg font-bold text-red-600">⚠</span>
+          <span className="text-sm font-medium text-red-700">{warning}</span>
         </div>
       )}
 
       {/* ── Header ── */}
       <header className={`bg-white border-b border-slate-200 px-5 py-3 flex items-center justify-between shadow-sm ${warning ? 'mt-12' : ''}`}>
         <div className="flex items-center gap-3">
-          <div className="w-7 h-7 bg-blue-600 rounded flex items-center justify-center">
-            <span className="text-white text-xs font-bold">AP</span>
+          <div className="flex items-center justify-center bg-blue-600 rounded w-7 h-7">
+            <span className="text-xs font-bold text-white">AP</span>
           </div>
           <div>
-            <div className="text-sm font-medium text-slate-800 leading-none">Мэдээллийн систем</div>
+            <div className="text-sm font-medium leading-none text-slate-800">Мэдээллийн систем</div>
             <div className="text-xs text-slate-400 mt-0.5">
               {student ? `${student.name} · ${student.student_id}` : 'Улирлын шалгалт · СЭЗИС'}
             </div>
@@ -305,14 +305,14 @@ export default function ExamPage() {
           </div>
 
           {/* Timer */}
-          <div className="flex items-center gap-2 border-l border-slate-200 pl-5">
+          <div className="flex items-center gap-2 pl-5 border-l border-slate-200">
             <div className="text-right">
               <div className={`text-xl font-bold tabular-nums font-mono ${
                 timeLeft < 300 ? 'text-red-600' : 'text-slate-800'
               }`}>
                 {formatTime(timeLeft)}
               </div>
-              <div className="text-xs text-slate-400 leading-none">Үлдсэн</div>
+              <div className="text-xs leading-none text-slate-400">Үлдсэн</div>
             </div>
           </div>
 
@@ -330,7 +330,7 @@ export default function ExamPage() {
       <div className="flex flex-1 overflow-hidden">
 
         {/* Question Panel */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 p-6 overflow-y-auto">
           <div className="max-w-3xl mx-auto">
 
             {/* Progress bar */}
@@ -356,11 +356,11 @@ export default function ExamPage() {
             </div>
 
             {/* Question card */}
-            <div className="bg-white rounded-xl border border-slate-200 p-6 mb-5">
-              <div className="text-sm font-bold text-blue-600 uppercase tracking-wider mb-4">
+            <div className="p-6 mb-5 bg-white border rounded-xl border-slate-200">
+              <div className="mb-4 text-sm font-bold tracking-wider text-blue-600 uppercase">
                 Асуулт {current + 1}
               </div>
-              <p className="text-base text-slate-800 font-medium leading-relaxed mb-6">
+              <p className="mb-6 text-base font-medium leading-relaxed text-slate-800">
                 {q.text}
               </p>
 
@@ -370,14 +370,14 @@ export default function ExamPage() {
                   onChange={e => setAnswers(p => ({ ...p, [q.id]: e.target.value }))}
                   placeholder="Хариултаа энд бичнэ үү..."
                   rows={8}
-                  className="w-full border-2 border-slate-200 rounded-xl p-4 text-base text-slate-800 resize-none focus:outline-none focus:border-blue-400 placeholder-slate-300"
+                  className="w-full p-4 text-base border-2 resize-none border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:border-blue-400 placeholder-slate-300"
                 />
               ) : (
                 <div className="space-y-3">
                   {q.options?.map((opt, i) => (
                     <label
                       key={i}
-                      className="flex items-center gap-4 p-4 rounded-xl border-2 border-slate-200 cursor-pointer hover:bg-slate-50 transition-colors"
+                      className="flex items-center gap-4 p-4 transition-colors border-2 cursor-pointer rounded-xl border-slate-200 hover:bg-slate-50"
                     >
                       <input
                         type="radio"
@@ -395,7 +395,7 @@ export default function ExamPage() {
             </div>
 
             {/* Navigation */}
-            <div className="flex justify-between items-center">
+            <div className="flex items-center justify-between">
               <button
                 onClick={() => setCurrent(p => Math.max(0, p - 1))}
                 disabled={current === 0}
@@ -418,35 +418,35 @@ export default function ExamPage() {
         </div>
 
         {/* Camera Sidebar */}
-        <div className="w-64 bg-white border-l border-slate-200 flex flex-col p-5 gap-4">
-          <div className="text-sm font-bold text-slate-400 uppercase tracking-wider">
+        <div className="flex flex-col w-64 gap-4 p-5 bg-white border-l border-slate-200">
+          <div className="text-sm font-bold tracking-wider uppercase text-slate-400">
             Таны камер
           </div>
-          <div className="relative bg-black rounded-xl overflow-hidden aspect-video">
+          <div className="relative overflow-hidden bg-black rounded-xl aspect-video">
             <video
               ref={videoRef}
               autoPlay
               muted
               playsInline
-              className="w-full h-full object-cover"
+              className="object-cover w-full h-full"
             />
             {streamRef.current && (
-              <div className="absolute top-2 left-2 flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-white text-xs font-medium">REC</span>
+              <div className="absolute flex items-center gap-1 top-2 left-2">
+                <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                <span className="text-xs font-medium text-white">REC</span>
               </div>
             )}
           </div>
 
-          <div className="bg-slate-50 rounded-xl p-4">
-            <p className="text-sm text-slate-500 leading-relaxed">
+          <div className="p-4 bg-slate-50 rounded-xl">
+            <p className="text-sm leading-relaxed text-slate-500">
               Шалгалтын бичлэг хадгалагдаж байна
             </p>
           </div>
 
           {flagCount > 0 && (
-            <div className="bg-red-50 border-2 border-red-200 rounded-xl p-4">
-              <p className="text-sm text-red-600 font-bold">
+            <div className="p-4 border-2 border-red-200 bg-red-50 rounded-xl">
+              <p className="text-sm font-bold text-red-600">
                 {flagCount} анхааруулга бүртгэгдсэн
               </p>
             </div>

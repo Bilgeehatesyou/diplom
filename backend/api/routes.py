@@ -91,8 +91,10 @@ async def dashboard(exam_id: str = "exam_001", db: AsyncSession = Depends(get_db
     for st in students:
         sess = latest_by_student.get(st.id)
         events = []
-        if sess:
-            # Only events from THIS session (timestamp >= started_at, and if ended, <= ended_at)
+        # Sessions marked "reset" keep their events in DB (for audit / sortable by exam_id)
+        # but hide them from the teacher dashboard view.
+        is_reset = bool(sess and sess.decision == "reset")
+        if sess and not is_reset:
             q = select(RiskEvent).where(
                 RiskEvent.student_id == st.id,
                 RiskEvent.exam_id == exam_id,
@@ -111,14 +113,43 @@ async def dashboard(exam_id: str = "exam_001", db: AsyncSession = Depends(get_db
             "id": st.id,
             "name": st.name,
             "department": st.department,
-            "risk_score": round(sess.risk_score, 1) if sess else 0,
-            "decision": sess.decision if sess else "pending",
+            "risk_score": 0 if is_reset else (round(sess.risk_score, 1) if sess else 0),
+            "decision": "pending" if is_reset else (sess.decision if sess else "pending"),
             "online": bool(sess and sess.ended_at is None),
             "started_at": sess.started_at.isoformat() if sess and sess.started_at else None,
             "ended_at": sess.ended_at.isoformat() if sess and sess.ended_at else None,
             "events": events,
         })
     return result
+
+
+@router.post("/session/{student_id}/clear")
+async def clear_session(student_id: str, exam_id: str = "exam_001",
+                        db: AsyncSession = Depends(get_db)):
+    """
+    Mark the student's most recent session as 'reset': events stay in DB
+    (sortable by exam_id/student_id/timestamp), but the teacher dashboard
+    will treat them as cleared.
+    """
+    from sqlalchemy import update as _update
+    sess = (await db.execute(
+        select(ExamSession)
+        .where(ExamSession.student_id == student_id, ExamSession.exam_id == exam_id)
+        .order_by(desc(ExamSession.started_at))
+    )).scalars().first()
+    if not sess:
+        raise HTTPException(404, "Session олдсонгүй")
+    await db.execute(
+        _update(ExamSession)
+        .where(ExamSession.id == sess.id)
+        .values(
+            decision="reset",
+            risk_score=0.0,
+            ended_at=sess.ended_at or datetime.now(),
+        )
+    )
+    await db.commit()
+    return {"ok": True, "session_id": sess.id}
 
 
 @router.get("/report/student/{student_id}.csv")

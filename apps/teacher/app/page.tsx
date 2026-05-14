@@ -241,6 +241,22 @@ export default function TeacherDashboard() {
     })
   }
 
+  const handleClear = async (id: string) => {
+    if (!confirm('Энэ оюутны бүх бүртгэгдсэн үйлдлийг цэвэрлэх үү?\n(Мэдээлэл өгөгдлийн санд хадгалагдсан хэвээр үлдэнэ.)')) return
+    try {
+      const r = await fetch(`${API}/api/session/${id}/clear`, { method: 'POST' })
+      if (!r.ok) throw new Error('clear failed')
+      setStudents(p => {
+        const s = p[id]
+        if (!s) return p
+        return { ...p, [id]: { ...s, events: [], riskScore: 0, decision: 'pending' } }
+      })
+    } catch (e) {
+      console.error(e)
+      alert('Цэвэрлэхэд алдаа гарлаа')
+    }
+  }
+
   const handleLogout = () => {
     localStorage.removeItem('ap_teacher')
     router.push('/login')
@@ -255,14 +271,14 @@ export default function TeacherDashboard() {
   const selectedStudent = selected ? students[selected] : null
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-100">
-      <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shadow-sm">
+    <div className="flex flex-col min-h-screen bg-slate-100">
+      <header className="flex items-center justify-between px-6 py-3 bg-white border-b shadow-sm border-slate-200">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-blue-600 rounded-md flex items-center justify-center">
-            <span className="text-white text-sm font-bold">AP</span>
+          <div className="flex items-center justify-center w-8 h-8 bg-blue-600 rounded-md">
+            <span className="text-sm font-bold text-white">AP</span>
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-slate-800 leading-none">AI Proctor</h1>
+            <h1 className="text-sm font-semibold leading-none text-slate-800">AI Proctor</h1>
             <p className="text-xs text-slate-500 mt-0.5">Багшийн хяналтын самбар · {teacher.name}</p>
           </div>
         </div>
@@ -276,27 +292,27 @@ export default function TeacherDashboard() {
             {connectionStatus === 'connected' ? 'Серверт холбогдсон' :
              connectionStatus === 'connecting' ? 'Холбогдож байна...' : 'Сервертэй холболтоо алдсан'}
           </div>
-          <button onClick={handleLogout} className="text-xs text-slate-400 hover:text-slate-600 border-l border-slate-200 pl-6">
+          <button onClick={handleLogout} className="pl-6 text-xs border-l text-slate-400 hover:text-slate-600 border-slate-200">
             Гарах
           </button>
         </div>
       </header>
 
       {criticalAlerts.length > 0 && (
-        <div className="bg-red-50 border-b border-red-200 px-4 py-2 flex items-center gap-3">
-          <span className="text-xs font-semibold text-red-600 flex-shrink-0">ЦАХИЛГААН:</span>
+        <div className="flex items-center gap-3 px-4 py-2 border-b border-red-200 bg-red-50">
+          <span className="flex-shrink-0 text-xs font-semibold text-red-600">СЭЖИГТЭЙ ҮЙЛДЭЛ:</span>
           <div className="flex items-center gap-4 overflow-x-auto">
             {criticalAlerts.map((alert, i) => (
-              <span key={i} className="text-xs text-red-700 whitespace-nowrap font-medium">{alert}</span>
+              <span key={i} className="text-xs font-medium text-red-700 whitespace-nowrap">{alert}</span>
             ))}
           </div>
         </div>
       )}
 
       <div className="flex flex-1 overflow-hidden">
-        <aside className="w-72 bg-white border-r border-slate-200 flex flex-col">
-          <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Оюутнууд</span>
+        <aside className="flex flex-col bg-white border-r w-72 border-slate-200">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
+            <span className="text-xs font-semibold tracking-wider uppercase text-slate-500">Оюутнууд</span>
             <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">{studentList.length}</span>
           </div>
 
@@ -329,7 +345,7 @@ export default function TeacherDashboard() {
                       }`} />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-slate-800 truncate">{s.name}</div>
+                      <div className="text-sm font-medium truncate text-slate-800">{s.name}</div>
                       <div className="text-xs text-slate-400">{s.id}</div>
                     </div>
                     <div className="flex-shrink-0 text-right">
@@ -339,7 +355,7 @@ export default function TeacherDashboard() {
                       </div>
                     </div>
                   </div>
-                  <div className="mt-2 h-1 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-1 mt-2 overflow-hidden rounded-full bg-slate-100">
                     <div className={`h-full rounded-full transition-all duration-500 ${severityColor(s.riskScore)}`}
                          style={{ width: `${s.riskScore}%` }} />
                   </div>
@@ -349,14 +365,14 @@ export default function TeacherDashboard() {
           </div>
         </aside>
 
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className="flex-1 p-6 overflow-y-auto">
           {!selectedStudent ? (
             <div className="flex flex-col items-center justify-center h-full text-slate-400">
               <p className="text-sm">Зүүн талын жагсаалтаас оюутан сонгоно уу</p>
             </div>
           ) : (
-            <div className="flex flex-col gap-5 max-w-5xl">
-              <div className="bg-white rounded-lg border border-slate-200 p-5">
+            <div className="flex flex-col max-w-5xl gap-5">
+              <div className="p-5 bg-white border rounded-lg border-slate-200">
                 <div className="flex items-start justify-between mb-4">
                   <div>
                     <div className="flex items-center gap-2">
@@ -377,7 +393,7 @@ export default function TeacherDashboard() {
                     <span>Эрсдэлийн түвшин</span>
                     <span>{selectedStudent.riskScore >= 60 ? 'Өндөр' : selectedStudent.riskScore >= 30 ? 'Дунд' : 'Бага'}</span>
                   </div>
-                  <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-2 overflow-hidden rounded-full bg-slate-100">
                     <div className={`h-full rounded-full transition-all duration-700 ${severityColor(selectedStudent.riskScore)}`}
                          style={{ width: `${selectedStudent.riskScore}%` }} />
                   </div>
@@ -397,22 +413,22 @@ export default function TeacherDashboard() {
                 ) : (
                   <div className="flex gap-3">
                     <button onClick={() => handleDecision(selectedStudent.id, 'flagged')}
-                            className="px-4 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100">
+                            className="px-4 py-2 text-sm font-medium text-red-600 border border-red-200 rounded-lg bg-red-50 hover:bg-red-100">
                       Сэжигтэй тэмдэглэх
                     </button>
                     <button onClick={() => handleDecision(selectedStudent.id, 'cleared')}
-                            className="px-4 py-2 text-sm font-medium text-emerald-600 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100">
+                            className="px-4 py-2 text-sm font-medium border rounded-lg text-emerald-600 bg-emerald-50 border-emerald-200 hover:bg-emerald-100">
                       Зөрчилгүй баталгаажуулах
                     </button>
                   </div>
                 )}
               </div>
 
-              <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+              <div className="overflow-hidden bg-white border rounded-lg border-slate-200">
                 <div className="px-5 py-3 border-b border-slate-100">
                   <h3 className="text-sm font-semibold text-slate-700">Камерийн зураг (амьд)</h3>
                 </div>
-                <div className="aspect-video bg-black flex items-center justify-center relative">
+                <div className="relative flex items-center justify-center bg-black aspect-video">
                   <img
                     ref={videoImgRef}
                     alt="Live"
@@ -426,27 +442,35 @@ export default function TeacherDashboard() {
                 </div>
               </div>
 
-              <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
-                <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
+              <div className="overflow-hidden bg-white border rounded-lg border-slate-200">
+                <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
                   <h3 className="text-sm font-semibold text-slate-700">Бүртгэгдсэн үйлдлүүд</h3>
                   <div className="flex items-center gap-3">
                     <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">{selectedStudent.events.length}</span>
                     <a
                       href={`${API}/api/report/student/${selectedStudent.id}.csv`}
                       download
-                      className="text-xs text-blue-600 hover:text-blue-700 font-medium"
+                      className="text-xs font-medium text-blue-600 hover:text-blue-700"
                     >
                       Тайлан татах ↓
                     </a>
+                    {selectedStudent.events.length > 0 && (
+                      <button
+                        onClick={() => handleClear(selectedStudent.id)}
+                        className="pl-3 text-xs font-medium border-l text-slate-500 hover:text-red-600 border-slate-200"
+                      >
+                        Цэвэрлэх ✕
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {selectedStudent.events.length === 0 ? (
-                  <div className="py-12 text-center text-sm text-slate-400">Одоохондоо үйлдэл бүртгэгдээгүй</div>
+                  <div className="py-12 text-sm text-center text-slate-400">Одоохондоо үйлдэл бүртгэгдээгүй</div>
                 ) : (
                   <div className="divide-y divide-slate-100">
                     {selectedStudent.events.map((ev, i) => (
-                      <div key={i} className="px-5 py-3 flex items-start gap-3 hover:bg-slate-50">
+                      <div key={i} className="flex items-start gap-3 px-5 py-3 hover:bg-slate-50">
                         <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 mt-[5px] ${
                           ev.severity === 'high' ? 'bg-red-500' : ev.severity === 'medium' ? 'bg-amber-400' : 'bg-blue-400'
                         }`} />
@@ -455,10 +479,10 @@ export default function TeacherDashboard() {
                             src={`${API}/api/incident/${ev.snapshot}`}
                             alt="snapshot"
                             onClick={() => setSnapshotPreview(`${API}/api/incident/${ev.snapshot}`)}
-                            className="w-16 h-12 object-cover rounded border border-slate-200 cursor-pointer hover:border-blue-400 flex-shrink-0"
+                            className="flex-shrink-0 object-cover w-16 h-12 border rounded cursor-pointer border-slate-200 hover:border-blue-400"
                           />
                         ) : (
-                          <div className="w-16 h-12 bg-slate-50 rounded flex-shrink-0" />
+                          <div className="flex-shrink-0 w-16 h-12 rounded bg-slate-50" />
                         )}
                         <div className="flex-1 min-w-0">
                           <p className="text-sm text-slate-700">{ev.message}</p>
@@ -483,9 +507,9 @@ export default function TeacherDashboard() {
       {snapshotPreview && (
         <div
           onClick={() => setSnapshotPreview(null)}
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center cursor-pointer p-8"
+          className="fixed inset-0 z-50 flex items-center justify-center p-8 cursor-pointer bg-black/80"
         >
-          <img src={snapshotPreview} alt="snapshot" className="max-w-full max-h-full object-contain rounded" />
+          <img src={snapshotPreview} alt="snapshot" className="object-contain max-w-full max-h-full rounded" />
         </div>
       )}
     </div>

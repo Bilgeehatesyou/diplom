@@ -33,7 +33,8 @@
       "Bash(where.exe ffmpeg *)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" \"http://localhost:8000/api/incident/B22FA1260/20260514_222113_928_tab_switch.jpg\")",
       "PowerShell($items = Get-ChildItem 'D:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\models\\\\incidents\\\\B22FA1260' -ErrorAction SilentlyContinue; if \\($items\\) { $items.Count } else { 'empty or missing' })",
-      "Bash(xxd d:/hicheel/diplom/ai-proctor/.gitignore)"
+      "Bash(xxd d:/hicheel/diplom/ai-proctor/.gitignore)",
+      "Bash(rm /Users/bilgeehatesyou/.claude/projects/-Users-bilgeehatesyou-ai-proctor/memory/project_aiproctor.md)"
     ]
   }
 }
