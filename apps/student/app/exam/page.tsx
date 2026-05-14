@@ -46,9 +46,10 @@ export default function ExamPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const canvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'))
   const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const audioIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const startRecorderRef = useRef<(() => void) | null>(null)
 
+  const [student, setStudent] = useState<{ student_id: string; name: string } | null>(null)
   const [timeLeft, setTimeLeft] = useState(50 * 60)
   const [warning, setWarning] = useState<string | null>(null)
   const [answers, setAnswers] = useState<Record<number, string>>({})
@@ -56,61 +57,120 @@ export default function ExamPage() {
   const [flagCount, setFlagCount] = useState(0)
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
 
+  const [isFreshExam, setIsFreshExam] = useState(true)
+
+  // Load student session + restore saved answers + restore timer
+  useEffect(() => {
+    const raw = localStorage.getItem('ap_student')
+    if (!raw) { router.push('/login'); return }
+    try {
+      const s = JSON.parse(raw)
+      setStudent(s)
+      const saved = localStorage.getItem(`ap_answers_${s.student_id}`)
+      if (saved) {
+        try { setAnswers(JSON.parse(saved)) } catch {}
+      }
+      const key = `ap_endtime_${s.student_id}`
+      const existingEnd = parseInt(localStorage.getItem(key) || '0', 10)
+      const isFresh = !existingEnd || existingEnd < Date.now()
+      setIsFreshExam(isFresh)
+      const endTime = isFresh ? Date.now() + 50 * 60 * 1000 : existingEnd
+      if (isFresh) localStorage.setItem(key, String(endTime))
+      setTimeLeft(Math.max(0, Math.floor((endTime - Date.now()) / 1000)))
+    } catch { router.push('/login') }
+  }, [router])
+
+  // Autosave answers
+  useEffect(() => {
+    if (!student) return
+    localStorage.setItem(`ap_answers_${student.student_id}`, JSON.stringify(answers))
+  }, [answers, student])
+
+  // Fresh exam = always 0 flags. Mid-exam refresh = fetch current session count from API.
+  useEffect(() => {
+    if (!student) return
+    if (isFreshExam) {
+      setFlagCount(0)
+      return
+    }
+    const api = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+    fetch(`${api}/api/session/${student.student_id}/current`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => setFlagCount(data?.active ? (data.flag_count || 0) : 0))
+      .catch(() => {})
+  }, [student, isFreshExam])
+
   // Initialize camera and WebSocket
   useEffect(() => {
-    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: true })
-      .then(stream => {
-        streamRef.current = stream
-        if (videoRef.current) videoRef.current.srcObject = stream
-        initWS()
-      })
-      .catch(() => router.push('/'))
-
-    // Start audio recording (MediaRecorder)
-    const startAudio = () => {
-      if (!streamRef.current) return
-      const audioTracks = streamRef.current.getAudioTracks()
-      if (!audioTracks.length) return
-
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/opus'
-
-      const recorder = new MediaRecorder(streamRef.current, { mimeType })
-      mediaRecorderRef.current = recorder
-
-      recorder.ondataavailable = async (e) => {
-        if (e.data && wsRef.current?.readyState === WebSocket.OPEN) {
-          // Send marker so backend knows next bytes are audio
-          wsRef.current.send(JSON.stringify({ _audio: true }))
-          const blob = await e.data.arrayBuffer()
-          wsRef.current.send(blob)
+    const startStream = async () => {
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: true })
+      } catch {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+        } catch {
+          router.push('/')
+          return
         }
       }
 
-      // Send audio every 2 seconds
-      recorder.start(2000)
-      audioIntervalRef.current = setInterval(() => {
-        if (recorder.state === 'recording') recorder.requestData()
-      }, 2000)
+      streamRef.current = stream
+      if (videoRef.current) videoRef.current.srcObject = stream
+
+      // Define recorder starter — called on every WS open to get fresh EBML header
+      startRecorderRef.current = () => {
+        try {
+          if (mediaRecorderRef.current?.state !== 'inactive') {
+            try { mediaRecorderRef.current?.stop() } catch {}
+          }
+          const audioTracks = streamRef.current?.getAudioTracks() ?? []
+          if (audioTracks.length === 0) return
+          const audioOnly = new MediaStream(audioTracks)
+          const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            ? 'audio/webm;codecs=opus'
+            : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : ''
+          const recorder = mimeType
+            ? new MediaRecorder(audioOnly, { mimeType })
+            : new MediaRecorder(audioOnly)
+          mediaRecorderRef.current = recorder
+          recorder.ondataavailable = async (e) => {
+            if (!e.data || e.data.size === 0) return
+            const buf = await e.data.arrayBuffer()
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ _audio: true }))
+              wsRef.current.send(buf)
+            }
+          }
+          recorder.start(2000)
+          console.log('[Audio] recorder started (fresh EBML)')
+        } catch (err) {
+          console.error('[Audio] recorder error:', err)
+        }
+      }
+
+      initWS()
     }
 
-    startAudio()
+    startStream()
 
     return () => {
       streamRef.current?.getTracks().forEach(t => t.stop())
       wsRef.current?.close()
       if (frameIntervalRef.current) clearInterval(frameIntervalRef.current)
-      if (audioIntervalRef.current) clearInterval(audioIntervalRef.current)
       if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop()
     }
   }, [])
 
   const initWS = useCallback(() => {
-    const studentId = 'student_001'
+    const stored = typeof window !== 'undefined' ? localStorage.getItem('ap_student') : null
+    const studentId = stored ? (JSON.parse(stored).student_id as string) : 'unknown'
     const ws = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'}/ws/student/${studentId}`)
 
-    ws.onopen = () => setWsStatus('connected')
+    ws.onopen = () => {
+      setWsStatus('connected')
+      startRecorderRef.current?.()
+    }
     ws.onclose = () => {
       setWsStatus('disconnected')
       setTimeout(initWS, 3000)
@@ -126,7 +186,8 @@ export default function ExamPage() {
 
     wsRef.current = ws
 
-    // Start sending frames
+    // Clear old interval before starting new one (prevents leak on reconnect)
+    if (frameIntervalRef.current) clearInterval(frameIntervalRef.current)
     frameIntervalRef.current = setInterval(() => {
       const video = videoRef.current
       const ws = wsRef.current
@@ -140,8 +201,8 @@ export default function ExamPage() {
         if (blob && wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(blob)
         }
-      }, 'image/jpeg', 0.5)
-    }, 1000)
+      }, 'image/jpeg', 0.55)
+    }, 100)
   }, [])
 
   // Tab switch detection
@@ -171,24 +232,29 @@ export default function ExamPage() {
     }
   }, [])
 
-  // Countdown timer
+  // Countdown timer (reads end-time from localStorage so refresh keeps countdown correct)
   useEffect(() => {
+    if (!student) return
+    const key = `ap_endtime_${student.student_id}`
     const t = setInterval(() => {
-      setTimeLeft(p => {
-        if (p <= 1) {
-          handleSubmit()
-          return 0
-        }
-        return p - 1
-      })
+      const endTime = parseInt(localStorage.getItem(key) || '0', 10)
+      if (!endTime) return
+      const left = Math.max(0, Math.floor((endTime - Date.now()) / 1000))
+      setTimeLeft(left)
+      if (left <= 0) handleSubmit()
     }, 1000)
     return () => clearInterval(t)
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [student])
 
   const handleSubmit = () => {
     streamRef.current?.getTracks().forEach(t => t.stop())
     wsRef.current?.close()
     if (frameIntervalRef.current) clearInterval(frameIntervalRef.current)
+    if (student) {
+      localStorage.removeItem(`ap_answers_${student.student_id}`)
+      localStorage.removeItem(`ap_endtime_${student.student_id}`)
+    }
     router.push('/done')
   }
 
@@ -214,7 +280,9 @@ export default function ExamPage() {
           </div>
           <div>
             <div className="text-sm font-medium text-slate-800 leading-none">Мэдээллийн систем</div>
-            <div className="text-xs text-slate-400 mt-0.5">Улирлын шалгалт · СЭЗИС</div>
+            <div className="text-xs text-slate-400 mt-0.5">
+              {student ? `${student.name} · ${student.student_id}` : 'Улирлын шалгалт · СЭЗИС'}
+            </div>
           </div>
         </div>
 

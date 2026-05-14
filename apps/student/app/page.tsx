@@ -1,11 +1,27 @@
 'use client'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
+
+interface StudentInfo {
+  student_id: string
+  name: string
+  department: string
+}
 
 export default function HomePage() {
   const router = useRouter()
+  const [student, setStudent] = useState<StudentInfo | null>(null)
   const [agreed, setAgreed] = useState(false)
   const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    const raw = localStorage.getItem('ap_student')
+    if (!raw) {
+      router.push('/login')
+      return
+    }
+    try { setStudent(JSON.parse(raw)) } catch { router.push('/login') }
+  }, [router])
 
   const handleStart = async () => {
     if (!agreed) return
@@ -22,11 +38,16 @@ export default function HomePage() {
     }
   }
 
+  const handleLogout = () => {
+    localStorage.removeItem('ap_student')
+    router.push('/login')
+  }
+
+  if (!student) return null
+
   return (
     <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
       <div className="w-full max-w-md">
-
-        {/* Branding */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-12 h-12 bg-blue-600 rounded-lg mb-4">
             <span className="text-white text-lg font-bold tracking-tight">AP</span>
@@ -35,11 +56,19 @@ export default function HomePage() {
           <p className="text-sm text-slate-500 mt-1">Онлайн шалгалтын хяналтын систем</p>
         </div>
 
-        {/* Card */}
         <div className="bg-white rounded-lg border border-slate-200 shadow-sm">
-          <div className="px-6 pt-6 pb-4">
-            <h2 className="text-base font-semibold text-slate-800 mb-1">Шалгалт эхлэх</h2>
-            <p className="text-xs text-slate-500">Улирлын шалгалт · СЭЗИС МСМ</p>
+          <div className="px-6 pt-6 pb-4 flex items-start justify-between">
+            <div>
+              <h2 className="text-base font-semibold text-slate-800 mb-1">Шалгалт эхлэх</h2>
+              <p className="text-xs text-slate-500">{student.name} · {student.student_id}</p>
+              <p className="text-xs text-slate-400 mt-0.5">{student.department}</p>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="text-xs text-slate-400 hover:text-slate-600"
+            >
+              Гарах
+            </button>
           </div>
 
           <div className="px-6 pb-4">
@@ -86,15 +115,11 @@ export default function HomePage() {
           </div>
 
           <div className="px-6 pb-5 text-center">
-            <p className="text-xs text-slate-400">
-              Асуудал гарвал багштай холбогдоно уу
-            </p>
+            <p className="text-xs text-slate-400">Асуудал гарвал багштай холбогдоно уу</p>
           </div>
         </div>
 
-        <p className="text-center text-xs text-slate-400 mt-6">
-          СЭЗИС · Мэдээллийн систем · 2026
-        </p>
+        <p className="text-center text-xs text-slate-400 mt-6">СЭЗИС · Мэдээллийн систем · 2026</p>
       </div>
     </div>
   )

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, asdict
+from utils.log import log_ai, log_vad, log_warn, log_err, log_clf
 
 try:
     import mediapipe as mp
@@ -9,119 +10,189 @@ try:
     _face_mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=2, refine_landmarks=True,
                      min_detection_confidence=0.6, min_tracking_confidence=0.5)
     MP_OK = True
-    print("[AI] MediaPipe ✓")
+    log_ai("MediaPipe ✓")
 except Exception as e:
     MP_OK = False
-    print(f"[AI] MediaPipe алдаа: {e}")
+    log_err("AI", f"MediaPipe алдаа: {e}")
 
 try:
     from ultralytics import YOLO
     _yolo   = YOLO("yolov8n.pt")
     YOLO_OK = True
-    print("[AI] YOLOv8 ✓")
+    log_ai("YOLOv8 ✓")
 except Exception as e:
     _yolo   = None
     YOLO_OK = False
-    print(f"[AI] YOLO алдаа: {e}")
+    log_err("AI", f"YOLO алдаа: {e}")
 
-# ── Audio: Wav2Vec2 + Silero VAD ──────────────────────────────────────────────
-AUDIO_OK = False
-_wav2vec = None
-_vad_model = None
+# ── Audio: Cheating Classifier (WavLM) + Silero VAD ──────────────────────────
+AUDIO_OK    = False
+_clf_model  = None
+_clf_extractor = None
+_vad_model  = None
+
+_CLF_LABELS = ["normal", "talking_to_someone", "multiple_voices", "whispering"]
 
 try:
     import torch
-    from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-    _AUD_MODEL_DIR = "./models/wav2vec2-mn"
+    from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+    from pathlib import Path as _Path
+    # Resolve relative to repo root regardless of CWD
+    _REPO_ROOT    = _Path(__file__).parent.parent.parent
+    _CLF_MODEL_DIR = str(_REPO_ROOT / "models" / "cheating_classifier_v2")
     import os
-    if os.path.exists(_AUD_MODEL_DIR):
-        _wav2vec_proc = Wav2Vec2Processor.from_pretrained(_AUD_MODEL_DIR)
-        _wav2vec      = Wav2Vec2ForCTC.from_pretrained(_AUD_MODEL_DIR)
-        print("[AI] Wav2Vec2 Mongolian ✓")
+    if os.path.exists(_CLF_MODEL_DIR):
+        _clf_extractor = AutoFeatureExtractor.from_pretrained(_CLF_MODEL_DIR)
+        _clf_model     = AutoModelForAudioClassification.from_pretrained(_CLF_MODEL_DIR)
+        _clf_model.eval()
+        log_ai("Cheating Classifier (WavLM) ✓")
     else:
-        print(f"[AI] Wav2Vec2 загвар олдсонгүй: {_AUD_MODEL_DIR} — Silero VAD ашиглах")
+        log_warn("AI", f"Classifier олдсонгүй: {_CLF_MODEL_DIR} — VAD ашиглах")
 except Exception as e:
-    print(f"[AI] Wav2Vec2 алдаа: {e}")
+    log_err("AI", f"Classifier алдаа: {e}")
 
 try:
-    import silero_vad
-    _vad_model = silero_vad.load_vad()
-    print("[AI] Silero VAD ✓")
+    from silero_vad import load_silero_vad, get_speech_timestamps
+    _vad_model = load_silero_vad()
+    log_ai("Silero VAD ✓")
 except Exception as e:
-    print(f"[AI] Silero VAD алдаа: {e}")
+    log_err("AI", f"Silero VAD алдаа: {e}")
 
-AUDIO_OK = _vad_model is not None or _wav2vec is not None
+AUDIO_OK = _vad_model is not None or _clf_model is not None
 if AUDIO_OK:
-    print("[AI] Audio мониторинг ✓")
+    log_ai("Audio мониторинг ✓")
 
 
 def analyze_audio_samples(audio_samples: np.ndarray, sample_rate: int = 16000,
                           ctx: dict = None) -> list:
     """
-    Audio clip дээр гадны яриа / олон хүн / чанга яриаг илрүүлнэ.
+    Audio clip дээр хуурамч үйлдлийг илрүүлнэ.
     audio_samples: numpy array, mono, 16kHz, float32 [-1, 1]
-    ctx: student context dict (frame_no, audio_speech_count гэх мэт)
+    ctx: student context dict
     Returns list of DetectionEvent objects.
     """
     events = []
-    now = datetime.now().isoformat()
+    now    = datetime.now().isoformat()
     if ctx is None:
         ctx = {}
 
-    if _vad_model is None and _wav2vec is None:
+    if _vad_model is None and _clf_model is None:
         return events
 
-    # ── VAD: speech detection ──────────────────────────────────────────
+    # ── Step 1: VAD — speech идэж байгаа эсэхийг шалгах ──────────────
+    is_speech    = True  # default: assume speech if no VAD
+    speech_prob  = 1.0
     if _vad_model is not None:
         try:
-            speech_prob = _vad_model.forward(audio_samples, sample_rate).item()
-            is_speech = speech_prob > 0.5
-
-            # Хэт удаан speech (гадны яриа чанга яриж байж боломжтой)
-            ctx["_audio_speech_frames"] = ctx.get("_audio_speech_frames", 0)
-            if is_speech:
-                ctx["_audio_speech_frames"] += 1
-                speech_sec = ctx["_audio_speech_frames"] * (len(audio_samples) / sample_rate)
-                if speech_sec > 5.0 and speech_sec < 10.0 and speech_sec % 2 < 0.5:
-                    events.append(DetectionEvent(
-                        "audio_speech_detected", "medium",
-                        f"Чанга яриа {int(speech_sec)} секунд илэрлээ",
-                        round(speech_prob, 2), now
-                    ))
-            else:
+            import torch as _torch
+            _t = _torch.tensor(audio_samples)
+            speech_timestamps = get_speech_timestamps(_t, _vad_model, sampling_rate=sample_rate)
+            is_speech   = len(speech_timestamps) > 0
+            speech_prob = 1.0 if is_speech else 0.0
+            rms = float(np.sqrt(np.mean(audio_samples**2)))
+            total_speech_sec = sum((t['end'] - t['start']) for t in speech_timestamps) / sample_rate
+            log_vad(is_speech, total_speech_sec, rms)
+            if not is_speech:
                 ctx["_audio_speech_frames"] = 0
-        except Exception as e:
-            print(f"[VAD] Алдаа: {e}")
+                # VAD can miss very quiet whispers — catch by RMS
+                if 0.008 < rms < 0.035:
+                    ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
+                    wc = ctx["_whisper_count"]
+                    if wc >= 3 and wc % 3 == 0:
+                        events.append(DetectionEvent(
+                            "audio_whispering", "medium",
+                            "Шивнэх яриа илэрлээ",
+                            round(min(rms * 25, 1.0), 2), now
+                        ))
+                else:
+                    ctx["_whisper_count"] = 0
+                return events
 
-    # ── Wav2Vec2: гадны хэл / гадны хүн илрүүлэх ──────────────────────
-    if _wav2vec is not None and _wav2vec_proc is not None:
+            # VAD detected speech
+            # Short + quiet → whisper
+            if total_speech_sec < 1.0 and rms < 0.05:
+                ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
+                wc = ctx["_whisper_count"]
+                if wc >= 2 and wc % 2 == 0:
+                    events.append(DetectionEvent(
+                        "audio_whispering", "medium",
+                        "Шивнэх яриа илэрлээ",
+                        round(min(rms * 25, 1.0), 2), now
+                    ))
+                return events
+
+            ctx["_whisper_count"] = 0
+            ctx["_audio_speech_frames"] = ctx.get("_audio_speech_frames", 0) + 1
+            sf = ctx["_audio_speech_frames"]
+            # Fire on first qualifying batch, then every 3 batches (~12s repeat)
+            if sf == 1 or sf % 3 == 0:
+                events.append(DetectionEvent(
+                    "audio_speech", "high",
+                    "Яриа илэрлээ — хориотой",
+                    round(min(rms * 10, 1.0), 2), now
+                ))
+        except Exception as e:
+            log_err("VAD", f"Алдаа: {e}")
+
+    # ── Step 2: Classifier — яриа ямар төрлийн эсэхийг тодорхойлох ───
+    if _clf_model is not None and _clf_extractor is not None and is_speech:
         try:
             import torch
-            inputs = _wav2vec_proc(
-                audio_samples,
+            max_len = 16000 * 5
+            clip    = audio_samples[:max_len] if len(audio_samples) > max_len else audio_samples
+            inputs  = _clf_extractor(
+                clip,
                 sampling_rate=sample_rate,
                 return_tensors="pt",
-                padding=True
+                max_length=max_len,
+                truncation=True,
+                padding="max_length",
             )
             with torch.no_grad():
-                logits = _wav2vec(inputs.input_values).logits
-            predicted_ids = torch.argmax(logits, dim=-1)
-            transcription = _wav2vec_proc.batch_decode(predicted_ids)[0]
+                logits = _clf_model(**inputs).logits
+            probs     = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+            pred_id   = int(probs.argmax())
+            pred_label = _CLF_LABELS[pred_id]
+            confidence = float(probs[pred_id])
 
-            # Mongolian бус текст илэрвэл
-            mongolian_chars = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюяүөӨАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯҮӨ")
-            non_mn = sum(1 for c in transcription if c.isalpha() and c not in mongolian_chars)
-            if non_mn > len(transcription) * 0.3 and len(transcription.strip()) > 5:
-                ctx["_foreign_audio_count"] = ctx.get("_foreign_audio_count", 0) + 1
-                fc = ctx["_foreign_audio_count"]
-                if fc % 3 == 0:
+            ctx["_clf_history"] = ctx.get("_clf_history", [])
+            ctx["_clf_history"].append(pred_label)
+            if len(ctx["_clf_history"]) > 5:
+                ctx["_clf_history"].pop(0)
+
+            # Олонхийн саналаар шийдэх (noise-г бууруулах)
+            history  = ctx["_clf_history"]
+            majority = max(set(history), key=history.count)
+
+            if majority == "talking_to_someone" and history.count("talking_to_someone") >= 2:
+                ctx["_talking_count"] = ctx.get("_talking_count", 0) + 1
+                if ctx["_talking_count"] % 3 == 1:
                     events.append(DetectionEvent(
-                        "foreign_audio", "high",
-                        f"Гадны яриа/хэл илэрлээ: '{transcription}'",
-                        0.85, now
+                        "audio_talking", "high",
+                        "Хэн нэгэнтэй ярилцаж байна",
+                        round(confidence, 2), now
                     ))
+
+            elif majority == "multiple_voices" and history.count("multiple_voices") >= 2:
+                ctx["_multi_count"] = ctx.get("_multi_count", 0) + 1
+                if ctx["_multi_count"] % 3 == 1:
+                    events.append(DetectionEvent(
+                        "audio_multiple_voices", "high",
+                        "Олон хүний яриа илэрлээ",
+                        round(confidence, 2), now
+                    ))
+
+            elif majority == "whispering" and history.count("whispering") >= 3:
+                ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
+                if ctx["_whisper_count"] % 4 == 1:
+                    events.append(DetectionEvent(
+                        "audio_whispering", "medium",
+                        "Шивнэх яриа илэрлээ",
+                        round(confidence, 2), now
+                    ))
+
         except Exception as e:
-            print(f"[Wav2Vec2] Алдаа: {e}")
+            log_err("CLF", f"Алдаа: {e}")
 
     return events
 
@@ -166,21 +237,24 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
         mesh = _face_mesh.process(rgb)
         if mesh.multi_face_landmarks:
             lm = mesh.multi_face_landmarks[0].landmark
-            dx = abs(lm[263].x - lm[33].x)
-            dy = abs(lm[1].y - (lm[33].y + lm[263].y) / 2)
-            if dx < 0.06 or dy > 0.08:
+            # Measure how far nose is offset from eye midpoint, normalized by eye width
+            face_w    = abs(lm[263].x - lm[33].x)
+            eye_mid_x = (lm[33].x + lm[263].x) / 2
+            nose_x    = lm[4].x   # nose tip
+            turn_ratio = abs(nose_x - eye_mid_x) / face_w if face_w > 0.01 else 0
+            if turn_ratio > 0.20:  # head turned >~30 degrees away
                 ctx["gaze_away_count"] = ctx.get("gaze_away_count", 0) + 1
                 g = ctx["gaze_away_count"]
-                if g >= 15 and g % 15 == 0:
+                if g >= 10 and g % 10 == 0:
                     events.append(DetectionEvent("gaze_away","medium",
                         f"Дэлгэцээс {g} секунд өөр тийш харсан",
-                        round(max(0, 1 - dx / 0.1), 2), now))
+                        round(min(turn_ratio, 1.0), 2), now))
             else:
                 ctx["gaze_away_count"] = 0
 
     # 4. Объект
     if YOLO_OK and _yolo:
-        for r in _yolo.predict(frame, conf=0.45, verbose=False):
+        for r in _yolo.predict(frame, conf=0.65, verbose=False):
             for box in r.boxes:
                 name = _yolo.names[int(box.cls)]
                 if name in FORBIDDEN_OBJECTS:

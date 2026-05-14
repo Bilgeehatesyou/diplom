@@ -1,15 +1,44 @@
+# Python
 .venv/
 backend/.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# Node / Next.js
 node_modules/
 apps/student/node_modules/
+apps/teacher/node_modules/
 .next/
 apps/student/.next/
-.env
+apps/teacher/.next/
+
+# Build outputs
 dist/
 build/
+
+# Env / secrets
+.env
+.env.local
+*.local
+
+# DB (per-machine, will be auto-created)
 aiproctor.db
+*.db-journal
+
+# Large model artifacts (transfer manually)
 yolov8n.pt
 data/
+data.zip
 models/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json

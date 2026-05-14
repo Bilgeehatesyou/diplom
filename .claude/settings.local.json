@@ -22,7 +22,18 @@
       "Bash(pip install *)",
       "Bash(Move-Item *)",
       "PowerShell(Copy-Item *)",
-      "Bash(wmic logicaldisk *)"
+      "Bash(wmic logicaldisk *)",
+      "PowerShell(ffmpeg -version 2>&1)",
+      "PowerShell(Get-ChildItem \"D:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\models\" -Recurse -File | Where-Object { $_.Extension -in \".json\", \".log\", \".txt\" } | Select-Object FullName, Length, LastWriteTime)",
+      "PowerShell(Get-ChildItem \"D:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\models\" -Recurse | Select-Object FullName, Mode, Length | Where-Object { $_.Length -lt 10MB -or $_.Mode -eq \"d-----\" })",
+      "Bash(dir \"D:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\models\\\\cheating_classifier_v2\\\\\")",
+      "Bash(ls /mnt/d/hicheel/diplom/ai-proctor/)",
+      "Read(//mnt/d/hicheel/diplom/**)",
+      "Bash(dir \"d:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\apps\\\\student\\\\app\" /b /s)",
+      "Bash(where.exe ffmpeg *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" \"http://localhost:8000/api/incident/B22FA1260/20260514_222113_928_tab_switch.jpg\")",
+      "PowerShell($items = Get-ChildItem 'D:\\\\hicheel\\\\diplom\\\\ai-proctor\\\\models\\\\incidents\\\\B22FA1260' -ErrorAction SilentlyContinue; if \\($items\\) { $items.Count } else { 'empty or missing' })",
+      "Bash(xxd d:/hicheel/diplom/ai-proctor/.gitignore)"
     ]
   }
 }
