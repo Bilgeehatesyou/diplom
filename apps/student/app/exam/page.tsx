@@ -44,7 +44,7 @@ export default function ExamPage() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'))
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const startRecorderRef = useRef<(() => void) | null>(null)
@@ -193,10 +193,11 @@ export default function ExamPage() {
       const ws = wsRef.current
       if (!video || !ws || ws.readyState !== WebSocket.OPEN) return
 
+      if (!canvasRef.current) canvasRef.current = document.createElement('canvas')
       const canvas = canvasRef.current
       canvas.width = video.videoWidth || 640
       canvas.height = video.videoHeight || 480
-      canvas.getContext('2d')?.drawImage(video, 0, 0,)
+      canvas.getContext('2d')?.drawImage(video, 0, 0)
       canvas.toBlob(blob => {
         if (blob && wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(blob)

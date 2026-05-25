@@ -426,7 +426,7 @@ export default function TeacherDashboard() {
 
               <div className="overflow-hidden bg-white border rounded-lg border-slate-200">
                 <div className="px-5 py-3 border-b border-slate-100">
-                  <h3 className="text-sm font-semibold text-slate-700">Камерийн зураг (амьд)</h3>
+                  <h3 className="text-sm font-semibold text-slate-700">Камерийн зураг (шууд)</h3>
                 </div>
                 <div className="relative flex items-center justify-center bg-black aspect-video">
                   <img
