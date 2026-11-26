@@ -96,7 +96,8 @@ const EVENT_LABEL: Record<string, string> = {
   looking_down: 'Удаан доош харав',
   looking_down_phone: 'Доош харах + утас',
   object_detected: 'Объект',
-  audio_speech: 'Яриа',
+  audio_speech: 'Тасралтгүй яриа',
+  audio_short_speech: 'Богино яриа',
   audio_whispering: 'Шивнэх',
   audio_talking: 'Ярилцаж байна',
   audio_multiple_voices: 'Олон хүний яриа',
@@ -138,6 +139,9 @@ function EventIcon({ type }: { type: string }) {
         </svg>
       )
     case 'audio_speech':
+    case 'audio_short_speech':
+    case 'audio_talking':
+    case 'audio_multiple_voices':
     case 'audio_whispering':
       return (
         <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

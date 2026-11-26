@@ -53,8 +53,10 @@ Docker: `SECRET_KEY=... docker-compose up`
 | gaze_away | medium | Камер — калибровктой: толгой >25° эргэх, >20° дээш харах, нүд хажуу тийш (3с+) |
 | looking_down | low | Камер — 15с+ тасралтгүй доош харах (бичих нь хэвийн тул бага жин) |
 | looking_down_phone | high | Камер — доош харах + утасны сул илрүүлэлт хамт |
-| audio_speech / audio_talking / audio_multiple_voices | high | Микрофон |
-| audio_whispering | medium | Микрофон |
+| audio_speech | high | Микрофон — тасралтгүй яриа (сүүлийн ~6с-ийн 40%+) |
+| audio_talking / audio_multiple_voices | high | Микрофон — WavLM классификатор (сүүлийн 5с-ийн гүйдэг цонх) |
+| audio_short_speech | low | Микрофон — ганц удаагийн 1с+ хэллэг |
+| audio_whispering | medium | Микрофон — нам дуу + ярианы хэмнэл (гарын товшилт, сэнс шүүгдэнэ) |
 | video_stalled / stream_lost | high | Серверийн watchdog (кадр 6с ирэхгүй / холболт 10с+ тасрах) |
 | audio_stalled | medium | Серверийн watchdog |
 | camera_ended, mic_ended, mic_denied, virtual_camera | high | Browser |

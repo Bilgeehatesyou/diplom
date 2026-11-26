@@ -6,9 +6,15 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from utils.log import log_ai, log_vad, log_warn, log_err, log_clf
 from ai.gaze import gaze_step
+from ai import audio_features as af
 
 GAZE_AWAY_SEC    = 3    # дараалсан 3 шинжилгээ (~3с) өөр тийш харвал gaze_away
 LOOKING_DOWN_SEC = 15   # 15с тасралтгүй доош харвал looking_down (low)
+
+CLF_WINDOW_SEC         = 5    # классификаторт өгөх гүйдэг цонх (сургалтын клипийн урт)
+SPEECH_HIST_CHUNKS     = 3    # ~6с (2с chunk × 3)
+SHORT_SPEECH_SEC       = 1.0  # үүнээс богино яриа = "аан", ханиалга, шивнээ
+SUSTAINED_SPEECH_RATIO = 0.4  # сүүлийн ~6с-ийн 40%+ нь яриа бол тасралтгүй яриа (high)
 
 # Загварууд бүх оюутанд нэг instance → thread-safe биш. asyncio.to_thread-ээс зэрэг
 # дуудагддаг тул тус бүрд lock. (Оюутан бүрт тусдаа instance нь санах ой их зарцуулна.)
@@ -97,7 +103,7 @@ def analyze_audio_samples(audio_samples: np.ndarray, sample_rate: int = 16000,
         events = _analyze_audio_impl(audio_samples, sample_rate, ctx)
     # Classifier нь яриаг илүү нарийн ангилсан бол ерөнхий VAD "audio_speech"-ийг давхар тооцохгүй
     if any(e.event_type in ("audio_talking", "audio_multiple_voices") for e in events):
-        events = [e for e in events if e.event_type != "audio_speech"]
+        events = [e for e in events if e.event_type not in ("audio_speech", "audio_short_speech")]
     return events
 
 
@@ -110,6 +116,12 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
 
     if _vad_model is None and _clf_model is None:
         return events
+
+    # Гүйдэг цонх: сүүлийн CLF_WINDOW_SEC секундын бодит дуу. Классификатор 5с клип дээр
+    # сурсан тул 2с chunk-ийг 3с тэгээр дүүргэхийн оронд энэ цонхыг өгнө.
+    win = ctx.get("_pcm_window")
+    win = audio_samples if win is None else np.concatenate([win, audio_samples])
+    ctx["_pcm_window"] = win[-CLF_WINDOW_SEC * sample_rate:]
 
     # ── Step 1: VAD — speech идэж байгаа эсэхийг шалгах ──────────────
     is_speech    = True  # default: assume speech if no VAD
@@ -124,6 +136,14 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
             rms = float(np.sqrt(np.mean(audio_samples**2)))
             total_speech_sec = sum((t['end'] - t['start']) for t in speech_timestamps) / sample_rate
             log_vad(is_speech, total_speech_sec, rms)
+
+            # Сүүлийн ~6с-д яриа эзэлсэн хувь (3 chunk) — нэг удаагийн "аан"-ыг
+            # тасралтгүй ярианаас ялгана.
+            hist = ctx.setdefault("_speech_hist", [])
+            hist.append((len(audio_samples) / sample_rate, total_speech_sec))
+            del hist[:-SPEECH_HIST_CHUNKS]
+            speech_ratio = sum(s for _, s in hist) / max(sum(d for d, _ in hist), 1e-6)
+            feat = af.features(audio_samples, sample_rate)
 
             # Dynamic baseline calibration: track ambient noise floor per session.
             # Silent (no VAD speech) хэсгүүдээс EMA-аар суралцаж microphone бүрд adapt хийнэ.
@@ -144,8 +164,9 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
 
             if not is_speech:
                 ctx["_audio_speech_frames"] = 0
-                # VAD can miss very quiet whispers — catch by RMS relative to baseline
-                if whisper_floor < rms < whisper_ceil:
+                # VAD can miss very quiet whispers — catch by RMS relative to baseline,
+                # гэхдээ зөвхөн ярианы хэмнэлтэй үед (гарын товшилт, сэнс → биш)
+                if whisper_floor < rms < whisper_ceil and af.is_speech_like(feat):
                     ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
                     wc = ctx["_whisper_count"]
                     if wc >= 3 and wc % 3 == 0:
@@ -159,27 +180,43 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
                 return events
 
             # VAD detected speech
-            # Short + quiet → whisper (baseline-relative)
-            if total_speech_sec < 1.0 and rms < max(0.05, baseline + 0.04):
-                ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
-                wc = ctx["_whisper_count"]
-                if wc >= 2 and wc % 2 == 0:
-                    events.append(DetectionEvent(
-                        "audio_whispering", "medium",
-                        "Шивнэх яриа илэрлээ",
-                        round(min(rms * 25, 1.0), 2), now
-                    ))
+            if total_speech_sec < SHORT_SPEECH_SEC:
+                # Ханиалга, ширээ тогших зэрэг цохилтот дууг VAD заримдаа яриа гэж андуурна
+                if af.is_impulsive(feat):
+                    ctx["_whisper_count"] = 0
+                    return events
+                # Short + quiet → whisper (baseline-relative)
+                if rms < max(0.05, baseline + 0.04):
+                    ctx["_whisper_count"] = ctx.get("_whisper_count", 0) + 1
+                    wc = ctx["_whisper_count"]
+                    if wc >= 2 and wc % 2 == 0:
+                        events.append(DetectionEvent(
+                            "audio_whispering", "medium",
+                            "Шивнэх яриа илэрлээ",
+                            round(min(rms * 25, 1.0), 2), now
+                        ))
+                # Богино чанга дуу ("аан", дуу алдах) → бүртгэхгүй
                 return events
 
             ctx["_whisper_count"] = 0
-            ctx["_audio_speech_frames"] = ctx.get("_audio_speech_frames", 0) + 1
-            sf = ctx["_audio_speech_frames"]
-            # Fire on first qualifying batch, then every 3 batches (~12s repeat)
-            if sf == 1 or sf % 3 == 0:
+            if speech_ratio >= SUSTAINED_SPEECH_RATIO:
+                # Тасралтгүй яриа (сүүлийн ~6с-ийн 40%+) → high
+                ctx["_audio_speech_frames"] = ctx.get("_audio_speech_frames", 0) + 1
+                sf = ctx["_audio_speech_frames"]
+                # Fire on first qualifying batch, then every 3 batches (~6s repeat, dedup 10s)
+                if sf == 1 or sf % 3 == 0:
+                    events.append(DetectionEvent(
+                        "audio_speech", "high",
+                        f"Тасралтгүй яриа илэрлээ (сүүлийн 6с-ийн {speech_ratio:.0%})",
+                        round(min(1.0, 0.5 + speech_ratio / 2), 2), now
+                    ))
+            else:
+                # Ганц удаагийн богино хэллэг (жишээ нь асуултаа уншиж байгаад дуугарах) → low
+                ctx["_audio_speech_frames"] = 0
                 events.append(DetectionEvent(
-                    "audio_speech", "high",
-                    "Яриа илэрлээ — хориотой",
-                    round(min(rms * 10, 1.0), 2), now
+                    "audio_short_speech", "low",
+                    "Богино яриа илэрлээ",
+                    0.5, now
                 ))
         except Exception as e:
             log_err("VAD", f"Алдаа: {e}")
@@ -188,8 +225,9 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
     if _clf_model is not None and _clf_extractor is not None and is_speech:
         try:
             import torch
-            max_len = 16000 * 5
-            clip    = audio_samples[:max_len] if len(audio_samples) > max_len else audio_samples
+            max_len = sample_rate * CLF_WINDOW_SEC
+            # Сүүлийн 5с-ийн бодит дуу (эхний секундүүдэд л богино байж, pad хийгдэнэ)
+            clip    = ctx.get("_pcm_window", audio_samples)[-max_len:]
             inputs  = _clf_extractor(
                 clip,
                 sampling_rate=sample_rate,

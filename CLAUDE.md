@@ -74,8 +74,9 @@ Setup (first time on a new machine):
 | `looking_down` | low | Pitch >20° down from baseline for 15+ s (writing is normal → low weight) |
 | `looking_down_phone` | high | Looking down + any `cell phone` candidate (conf ≥0.30) in the same frame |
 | `object_detected` | high | YOLO sees phone/book/laptop/remote (conf ≥0.65) |
-| `audio_speech` | high | VAD detects 1.5+ sec speech, fires on 1st & every 3rd batch |
-| `audio_whispering` | medium | RMS 0.008–0.05 (quiet speech), needs 2-3 consecutive |
+| `audio_speech` | high | VAD speech ≥1 s in chunk AND ≥40% of last ~6 s (3 chunks); 1st & every 3rd batch |
+| `audio_short_speech` | low | VAD speech ≥1 s but sustained ratio <40% (one-off phrase) |
+| `audio_whispering` | medium | RMS in baseline-relative band AND speech-like rhythm (`ai/audio_features.py`), 2-3 consecutive |
 | `tab_switch` / `fullscreen_exit` | medium | `visibilitychange` / `fullscreenchange` |
 | `focus_lost` / `copy_attempt` | low | window blur / copy-cut-paste |
 | `video_stalled` / `stream_lost` | high | server watchdog: no frame 6s / disconnected 10s+ |
@@ -104,7 +105,8 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 
 - `_DEDUP_WINDOW_SEC = 10` — same event type within 10s ignored
 - `_DECAY_PER_TICK = 1.0`, `_DECAY_TICK_SEC = 30` — score decay rate
-- Whisper detection: `rms 0.008–0.05`, needs 2-3 consecutive batches
+- Whisper detection: baseline-relative RMS band + `audio_features.is_speech_like` (energy concentration <0.5, envelope mod depth ≥0.3, 2–8 Hz syllabic share ≥0.4); impulsive chunks (keyboard, cough) never count as speech/whisper
+- Classifier input: rolling last 5 s of PCM (`CLF_WINDOW_SEC`), not the zero-padded 2 s chunk
 - Gaze (`backend/ai/gaze.py`): first 5 analyzed frames = per-student baseline (median, clamped to ±20°); baseline kept per session across reconnects; slow EMA drift capped at ±10°. Thresholds `YAW_THRESH_DEG=25`, `PITCH_DOWN/UP_THRESH_DEG=20`, `IRIS_THRESH=0.18`.
 - AI analysis period: `_ANALYSIS_PERIOD = 1.0` s (so face_missing "X seconds" stays in seconds)
 - Watchdog: `_VIDEO_STALL_SEC = 6`, `_AUDIO_STALL_SEC = 12`, `_STREAM_LOST_SEC = 10`
@@ -116,7 +118,7 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 3. Gaze thresholds (25°/20°) are heuristic — need tuning on labeled pilot data
 5. SQLite → PostgreSQL for production scale
 6. No incident snapshot cleanup → auto-delete on `cleared` decision or >30 days old
-7. Some audio false positives (whisper threshold tuning)
+7. Audio feature thresholds validated only on synthetic signals — need real recordings (keyboard, fan, whisper) to tune
 
 ## Don'ts
 
