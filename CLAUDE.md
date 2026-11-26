@@ -70,7 +70,9 @@ Setup (first time on a new machine):
 |---|---|---|
 | `face_missing` | high (15pts) | No face for 5+ seconds |
 | `multiple_faces` | high | >1 face in frame |
-| `gaze_away` | medium (7pts) | Head turned away 10+ seconds |
+| `gaze_away` | medium (7pts) | Calibrated head pose (solvePnP): yaw >25° / up >20° / iris >0.18 from the student's own baseline, 3+ s |
+| `looking_down` | low | Pitch >20° down from baseline for 15+ s (writing is normal → low weight) |
+| `looking_down_phone` | high | Looking down + any `cell phone` candidate (conf ≥0.30) in the same frame |
 | `object_detected` | high | YOLO sees phone/book/laptop/remote (conf ≥0.65) |
 | `audio_speech` | high | VAD detects 1.5+ sec speech, fires on 1st & every 3rd batch |
 | `audio_whispering` | medium | RMS 0.008–0.05 (quiet speech), needs 2-3 consecutive |
@@ -103,6 +105,7 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 - `_DEDUP_WINDOW_SEC = 10` — same event type within 10s ignored
 - `_DECAY_PER_TICK = 1.0`, `_DECAY_TICK_SEC = 30` — score decay rate
 - Whisper detection: `rms 0.008–0.05`, needs 2-3 consecutive batches
+- Gaze (`backend/ai/gaze.py`): first 5 analyzed frames = per-student baseline (median, clamped to ±20°); baseline kept per session across reconnects; slow EMA drift capped at ±10°. Thresholds `YAW_THRESH_DEG=25`, `PITCH_DOWN/UP_THRESH_DEG=20`, `IRIS_THRESH=0.18`.
 - AI analysis period: `_ANALYSIS_PERIOD = 1.0` s (so face_missing "X seconds" stays in seconds)
 - Watchdog: `_VIDEO_STALL_SEC = 6`, `_AUDIO_STALL_SEC = 12`, `_STREAM_LOST_SEC = 10`
 
@@ -110,7 +113,7 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 
 1. WavLM classifier doesn't generalize to browser audio → retraining with browser-recorded data needed
 2. Single exam (`exam_001`) defined in `backend/exams.py` → multi-exam DB schema (Exam/Question tables)
-3. Gaze has no per-student calibration and no pitch (looking down at lap not detected)
+3. Gaze thresholds (25°/20°) are heuristic — need tuning on labeled pilot data
 5. SQLite → PostgreSQL for production scale
 6. No incident snapshot cleanup → auto-delete on `cleared` decision or >30 days old
 7. Some audio false positives (whisper threshold tuning)

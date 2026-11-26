@@ -72,6 +72,7 @@ export default function ExamPage() {
   const [flagCount, setFlagCount] = useState(0)
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
   const [cameraOk, setCameraOk] = useState(false)
+  const [calibrated, setCalibrated] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [isFullscreen, setIsFullscreen] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -169,6 +170,8 @@ export default function ExamPage() {
         setFlagCount(p => p + 1)
         setWarning(data.message)
         setTimeout(() => setWarning(null), 4000)
+      } else if (data.type === 'calibrated') {
+        setCalibrated(true)
       } else if (data.type === 'exam_ended') {
         finish('/done?r=time')
       } else if (data.type === 'replaced') {
@@ -645,6 +648,13 @@ export default function ExamPage() {
               </div>
             )}
           </div>
+
+          {cameraOk && wsStatus === 'connected' && !calibrated && (
+            <div className="p-3 border border-blue-200 bg-blue-50 rounded-xl">
+              <p className="text-xs font-semibold text-blue-700">Камерыг тохируулж байна…</p>
+              <p className="text-xs text-blue-600 mt-0.5">Дэлгэц рүү шууд, хэвийн байрлалаар хэдэн секунд харна уу.</p>
+            </div>
+          )}
 
           <div className="p-4 bg-slate-50 rounded-xl">
             <p className="text-xs leading-relaxed text-slate-500">

@@ -130,6 +130,7 @@ _teachers       : set[TeacherConn]       = set()    # олон багш зэрэ
 _last_event_at  : dict[str, dict]        = {}       # student_id → {event_type → epoch}
 _latest_frame   : dict[str, bytes]       = {}       # student_id → сүүлийн JPEG (offline үед ч snapshot-д)
 _teacher_buffer : deque                  = deque(maxlen=100)   # багш offline үеийн event-үүд
+_gaze_baselines : dict[int, dict]        = {}       # session_id → харцын калибровк (reconnect-д хадгална)
 _bg_task        : asyncio.Task | None    = None
 
 
@@ -306,6 +307,10 @@ async def _video_worker(conn: StudentConn):
             if frame is None:
                 continue
             events = await asyncio.to_thread(analyze_frame, frame, conn.ctx)
+            if conn.ctx.get("gaze_calibrated") and not conn.ctx.get("_calib_notified"):
+                conn.ctx["_calib_notified"] = True
+                _gaze_baselines[conn.sess_id] = conn.ctx["gaze_baseline"]
+                await conn.send_json({"type": "calibrated"})
             for ev in events:
                 await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
         except asyncio.CancelledError:
@@ -402,6 +407,11 @@ async def student_ws(websocket: WebSocket, token: str = "", exam_id: str = DEFAU
         except Exception: pass
 
     conn = StudentConn(websocket, student_id, exam_id, sess.id)
+    # Reconnect: өмнөх калибровкийг ашиглана — дахин холбогдохдоо хажуу тийш харж
+    # baseline-ийг "сургах" боломжгүй.
+    if sess.id in _gaze_baselines:
+        conn.ctx["gaze_baseline"] = _gaze_baselines[sess.id]
+        conn.ctx["gaze_calibrated"] = True
     _students[student_id] = conn
     log_ws(f"✓ Оюутан: {student_id} (session {sess.id}, risk={sess.risk_score})")
     conn.tasks = [asyncio.create_task(_video_worker(conn)),

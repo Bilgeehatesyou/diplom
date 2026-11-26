@@ -50,7 +50,9 @@ Docker: `SECRET_KEY=... docker-compose up`
 | Event | Түвшин | Эх сурвалж |
 |---|---|---|
 | face_missing, multiple_faces, object_detected | high | Камер (сервер, 1 Hz) |
-| gaze_away | medium | Камер |
+| gaze_away | medium | Камер — калибровктой: толгой >25° эргэх, >20° дээш харах, нүд хажуу тийш (3с+) |
+| looking_down | low | Камер — 15с+ тасралтгүй доош харах (бичих нь хэвийн тул бага жин) |
+| looking_down_phone | high | Камер — доош харах + утасны сул илрүүлэлт хамт |
 | audio_speech / audio_talking / audio_multiple_voices | high | Микрофон |
 | audio_whispering | medium | Микрофон |
 | video_stalled / stream_lost | high | Серверийн watchdog (кадр 6с ирэхгүй / холболт 10с+ тасрах) |

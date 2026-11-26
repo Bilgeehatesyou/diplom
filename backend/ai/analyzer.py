@@ -5,6 +5,10 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from utils.log import log_ai, log_vad, log_warn, log_err, log_clf
+from ai.gaze import gaze_step
+
+GAZE_AWAY_SEC    = 3    # дараалсан 3 шинжилгээ (~3с) өөр тийш харвал gaze_away
+LOOKING_DOWN_SEC = 15   # 15с тасралтгүй доош харвал looking_down (low)
 
 # Загварууд бүх оюутанд нэг instance → thread-safe биш. asyncio.to_thread-ээс зэрэг
 # дуудагддаг тул тус бүрд lock. (Оюутан бүрт тусдаа instance нь санах ой их зарцуулна.)
@@ -289,47 +293,41 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
                 events.append(DetectionEvent("multiple_faces","high",
                     f"Камерт {n} хүн илэрлээ", round(conf,2), now))
 
-        # 3. Харц (head turn + iris-based eye direction)
+        # 3. Харц — толгойн байрлал (yaw/pitch°) + iris, оюутан бүрийн калибровктой (ai/gaze.py)
+        ctx["_looking_down_now"] = False
         if mesh.multi_face_landmarks:
             # Олон нүүртэй үед хамгийн том (камерт ойр = шалгуулагч) нүүрийг сонгоно
             def _face_width(f):
                 return abs(f.landmark[263].x - f.landmark[33].x)
             lm = max(mesh.multi_face_landmarks, key=_face_width).landmark
-            # Head turn — nose offset vs eye midpoint, normalized by eye width
-            face_w    = abs(lm[263].x - lm[33].x)
-            eye_mid_x = (lm[33].x + lm[263].x) / 2
-            nose_x    = lm[4].x
-            turn_ratio = abs(nose_x - eye_mid_x) / face_w if face_w > 0.01 else 0
-            head_away = turn_ratio > 0.20
+            h, w = frame.shape[:2]
+            g = gaze_step(lm, w, h, ctx)
 
-            # Iris-based eye gaze (refine_landmarks=True гэжарсан тул iris landmarks бэлэн)
-            eye_away   = False
-            eye_offset = 0.0
-            try:
-                # Left eye: outer 33, inner 133, iris center 468
-                l_w = lm[133].x - lm[33].x
-                # Right eye: outer 263, inner 362, iris center 473
-                r_w = lm[263].x - lm[362].x
-                if l_w > 0.005 and r_w > 0.005:
-                    l_iris = (lm[468].x - lm[33].x)  / l_w
-                    r_iris = (lm[473].x - lm[362].x) / r_w
-                    avg    = (l_iris + r_iris) / 2
-                    eye_offset = abs(avg - 0.5)
-                    eye_away   = eye_offset > 0.22
-            except (IndexError, AttributeError):
-                pass
+            if g["state"] == "tracking":
+                if g["away"]:
+                    ctx["gaze_away_count"] = ctx.get("gaze_away_count", 0) + 1
+                    n_away = ctx["gaze_away_count"]
+                    if n_away >= GAZE_AWAY_SEC and n_away % GAZE_AWAY_SEC == 0:
+                        events.append(DetectionEvent("gaze_away", "medium",
+                            f"Дэлгэцээс {n_away}с өөр тийш харсан ({g['reason']})",
+                            g["conf"], now))
+                else:
+                    ctx["gaze_away_count"] = 0
 
-            if head_away or eye_away:
-                ctx["gaze_away_count"] = ctx.get("gaze_away_count", 0) + 1
-                g = ctx["gaze_away_count"]
-                if g >= 3 and g % 3 == 0:
-                    reason = "толгойгоо эргүүлсэн" if head_away else "нүдээ хазайсан"
-                    metric = turn_ratio if head_away else eye_offset
-                    events.append(DetectionEvent("gaze_away","medium",
-                        f"Дэлгэцээс {g}с өөр тийш харсан ({reason})",
-                        round(min(metric, 1.0), 2), now))
-            else:
-                ctx["gaze_away_count"] = 0
+                # Доош харах нь (бичих, бодох) хэвийн → зөвхөн удаан үргэлжилбэл low
+                if g["down"]:
+                    ctx["_looking_down_now"] = True
+                    ctx["down_count"] = ctx.get("down_count", 0) + 1
+                    n_down = ctx["down_count"]
+                    if n_down >= LOOKING_DOWN_SEC and n_down % LOOKING_DOWN_SEC == 0:
+                        events.append(DetectionEvent("looking_down", "low",
+                            f"{n_down}с доош харж байна (доош {g['d_pitch']:.0f}°)",
+                            0.5, now))
+                else:
+                    ctx["down_count"] = 0
+        else:
+            ctx["gaze_away_count"] = 0
+            ctx["down_count"] = 0
 
     # 4. Объект (per-object threshold + multi-frame voting)
     # Гар утас бол хамгийн чухал → илүү мэдрэмжтэй (бага босготой)
@@ -385,6 +383,19 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
                     events.append(DetectionEvent("object_detected","high",
                         f'"{obj_name}" объект илэрлээ',
                         round(cur_conf, 2), now))
+
+        # Хосолсон нотолгоо: доош харж байх үед утасны сул (≥0.30) илрүүлэлт ч хангалттай —
+        # өвөр дээрх утас ихэвчлэн кадрын доод ирмэгт хэсэгчлэн л харагддаг.
+        phone_conf = seen_this_frame.get("cell phone", 0.0)
+        already = any(e.event_type == "object_detected" and "cell phone" in e.message for e in events)
+        if ctx.get("_looking_down_now") and phone_conf > 0 and not already:
+            last = ctx.get("_last_down_phone", -999)
+            cur  = ctx.get("frame_no", 0)
+            if cur - last > 10:
+                ctx["_last_down_phone"] = cur
+                events.append(DetectionEvent("looking_down_phone", "high",
+                    "Доош харж байх үед утас илэрлээ",
+                    round(max(phone_conf, 0.5), 2), now))
 
     ctx["frame_no"] = ctx.get("frame_no", 0) + 1
     return events
