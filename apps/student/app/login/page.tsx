@@ -1,8 +1,8 @@
 'use client'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+import ThemeToggle from '../../components/ThemeToggle'
+import { API, setStudent } from '../../lib/api'
 
 export default function StudentLogin() {
   const router = useRouter()
@@ -26,13 +26,14 @@ export default function StudentLogin() {
         throw new Error(err.detail || 'Нэвтрэх амжилтгүй')
       }
       const data = await res.json()
-      // Fresh login → wipe stale per-student state from any previous exam
+      // Хуучин хувилбарын (client-side таймер/хариулт) түлхүүрүүдийг цэвэрлэнэ.
+      // Шалгалтын хугацаа, хариулт одоо серверт хадгалагддаг тул дахин нэвтрэх нь юуг ч reset хийхгүй.
       for (const key of Object.keys(localStorage)) {
         if (key.startsWith('ap_answers_') || key.startsWith('ap_endtime_')) {
           localStorage.removeItem(key)
         }
       }
-      localStorage.setItem('ap_student', JSON.stringify(data))
+      setStudent(data)
       router.push('/')
     } catch (err: any) {
       setError(err.message || 'Алдаа гарлаа')
@@ -41,22 +42,25 @@ export default function StudentLogin() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-6">
+      <div className="absolute top-6 right-6">
+        <ThemeToggle />
+      </div>
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-12 h-12 bg-blue-600 rounded-lg mb-4">
+          <div className="inline-flex items-center justify-center w-12 h-12 bg-gradient-to-br from-ufe-600 to-ufe-700 rounded-lg mb-4 shadow-md shadow-ufe-500/30">
             <span className="text-white text-lg font-bold tracking-tight">AP</span>
           </div>
-          <h1 className="text-lg font-semibold text-slate-800">AI Proctor</h1>
-          <p className="text-sm text-slate-500 mt-1">Оюутны нэвтрэх хэсэг</p>
+          <h1 className="ufe-caps text-base text-slate-900 dark:text-slate-100">AI Proctor</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Оюутны нэвтрэх хэсэг</p>
         </div>
 
-        <form onSubmit={handleLogin} className="bg-white rounded-lg border border-slate-200 shadow-sm p-6">
-          <h2 className="text-base font-semibold text-slate-800 mb-1">Нэвтрэх</h2>
-          <p className="text-xs text-slate-500 mb-5">Оюутны кодоо оруулна уу</p>
+        <form onSubmit={handleLogin} className="bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 shadow-sm p-6">
+          <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 mb-1">Нэвтрэх</h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mb-5">Оюутны кодоо оруулна уу</p>
 
           <label className="block mb-4">
-            <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">Оюутны код</span>
+            <span className="ufe-caps text-[10px] text-slate-600 dark:text-slate-300">Оюутны код</span>
             <input
               type="text"
               required
@@ -64,23 +68,23 @@ export default function StudentLogin() {
               value={studentId}
               onChange={e => setStudentId(e.target.value.toUpperCase())}
               placeholder="B22FA1260"
-              className="mt-1.5 w-full px-3 py-2 text-sm border border-slate-200 rounded-md focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              className="mt-1.5 w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-700 rounded-md focus:outline-none focus:border-ufe-500 focus:ring-1 focus:ring-ufe-500 placeholder-slate-400 dark:placeholder-slate-600"
             />
           </label>
 
           <label className="block mb-5">
-            <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">Нууц үг</span>
+            <span className="ufe-caps text-[10px] text-slate-600 dark:text-slate-300">Нууц үг</span>
             <input
               type="password"
               required
               value={password}
               onChange={e => setPassword(e.target.value)}
-              className="mt-1.5 w-full px-3 py-2 text-sm border border-slate-200 rounded-md focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              className="mt-1.5 w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-700 rounded-md focus:outline-none focus:border-ufe-500 focus:ring-1 focus:ring-ufe-500"
             />
           </label>
 
           {error && (
-            <div className="mb-4 text-xs text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+            <div className="mb-4 text-xs text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 rounded-md px-3 py-2">
               {error}
             </div>
           )}
@@ -88,13 +92,13 @@ export default function StudentLogin() {
           <button
             type="submit"
             disabled={loading || !studentId || !password}
-            className="w-full py-2.5 text-sm font-semibold rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400"
+            className="ufe-caps w-full py-2.5 text-sm rounded-md text-white bg-ufe-600 hover:bg-ufe-700 disabled:bg-slate-200 dark:disabled:bg-slate-800 disabled:text-slate-400 dark:disabled:text-slate-500"
           >
             {loading ? 'Нэвтэрч байна...' : 'Нэвтрэх'}
           </button>
         </form>
 
-        <p className="text-center text-xs text-slate-400 mt-6">СЭЗИС · Мэдээллийн систем · 2026</p>
+        <p className="ufe-caps text-center text-[10px] text-slate-400 dark:text-slate-500 mt-6">СЭЗИС · Мэдээллийн систем · 2026</p>
       </div>
     </div>
   )

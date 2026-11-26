@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="UTF-8">
+<title>AI Proctor — Audio Sample Recorder</title>
+<style>
+  body { font-family: 'Inter', -apple-system, sans-serif; background: #0f172a; color: #f1f5f9; padding: 32px; max-width: 720px; margin: 0 auto; }
+  h1 { margin-top: 0; }
+  .card { background: #1e293b; padding: 24px; border-radius: 12px; margin-bottom: 16px; }
+  .classes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+  .class-btn { padding: 16px; border: 2px solid #334155; background: #0f172a; color: #f1f5f9; border-radius: 8px; cursor: pointer; font-size: 14px; transition: all 0.15s; }
+  .class-btn:hover { border-color: #3b82f6; }
+  .class-btn.active { border-color: #3b82f6; background: rgba(59,130,246,0.15); }
+  .class-btn small { display: block; opacity: 0.6; margin-top: 4px; font-size: 11px; }
+  .record-btn { display: block; width: 100%; padding: 20px; font-size: 16px; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; margin: 16px 0; transition: all 0.15s; }
+  .record-btn.idle { background: #3b82f6; color: white; }
+  .record-btn.recording { background: #ef4444; color: white; animation: pulse 1s infinite; }
+  .record-btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+  .progress { height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .progress-bar { height: 100%; background: #ef4444; width: 0%; transition: width 0.1s linear; }
+  .meter { height: 24px; background: #0f172a; border-radius: 4px; overflow: hidden; margin: 8px 0; border: 1px solid #334155; }
+  .meter-bar { height: 100%; background: linear-gradient(90deg, #10b981 0%, #f59e0b 60%, #ef4444 90%); width: 0%; transition: width 0.05s; }
+  .samples { font-size: 13px; }
+  .samples-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #334155; }
+  .samples-row:last-child { border-bottom: none; }
+  .info { font-size: 12px; opacity: 0.7; line-height: 1.6; }
+  code { background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>🎙 Audio Sample Recorder</h1>
+<p class="info">Browser-н MediaRecorder ашиглан AI Proctor-н production audio-той ижил distribution-той sample цуглуулж байна. Тус бүр 5 секундийн дамжуулга.</p>
+
+<div class="card">
+  <h3>1. Class сонгох</h3>
+  <div class="classes">
+    <button class="class-btn active" data-class="normal">
+      <strong>normal</strong>
+      <small>Чимээгүй (гар бичиг л)</small>
+    </button>
+    <button class="class-btn" data-class="talking">
+      <strong>talking</strong>
+      <small>Хэн нэгэнтэй ярих</small>
+    </button>
+    <button class="class-btn" data-class="whispering">
+      <strong>whispering</strong>
+      <small>Шивнэх (чимээгүй)</small>
+    </button>
+    <button class="class-btn" data-class="multiple">
+      <strong>multiple</strong>
+      <small>Олон хүний дуу</small>
+    </button>
+  </div>
+</div>
+
+<div class="card">
+  <h3>2. Mic түвшин шалгах</h3>
+  <div class="meter"><div class="meter-bar" id="meterBar"></div></div>
+  <p class="info">Дунд зэрэг (ногоон-шар) байх ёстой. Хэт намуурвал mic ойртуул.</p>
+</div>
+
+<div class="card">
+  <h3>3. Бичих (5 сек)</h3>
+  <button class="record-btn idle" id="recordBtn">⏺ Эхлүүлэх</button>
+  <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+</div>
+
+<div class="card">
+  <h3>4. Бичигдсэн дээжүүд</h3>
+  <div class="samples" id="samplesList">
+    <div class="info">Одоохондоо дээж байхгүй.</div>
+  </div>
+  <p class="info" style="margin-top: 16px;">
+    💡 Файл автоматаар татагдана. <code>training_data/{class}/</code> folder-уудад зохион байгуул.<br>
+    Зорилго: <strong>class бүрд 20-30 дээж (тус бүр 5 сек)</strong> = нийт ~10 минут.
+  </p>
+</div>
+
+<script>
+let selectedClass = 'normal';
+let isRecording = false;
+let stream = null;
+let recorder = null;
+let audioCtx = null;
+let analyser = null;
+let meterRaf = null;
+let samples = { normal: 0, talking: 0, whispering: 0, multiple: 0 };
+
+// Class buttons
+document.querySelectorAll('.class-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.class-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedClass = btn.dataset.class;
+  });
+});
+
+// Mic init
+async function initMic() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    updateMeter();
+  } catch (err) {
+    alert('Microphone-руу хандах боломжгүй: ' + err.message);
+  }
+}
+
+function updateMeter() {
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = (data[i] - 128) / 128;
+    sum += v * v;
+  }
+  const rms = Math.sqrt(sum / data.length);
+  document.getElementById('meterBar').style.width = Math.min(100, rms * 400) + '%';
+  meterRaf = requestAnimationFrame(updateMeter);
+}
+
+// Record
+document.getElementById('recordBtn').addEventListener('click', () => {
+  if (isRecording) return;
+  startRecording();
+});
+
+function startRecording() {
+  if (!stream) {
+    alert('Microphone бэлэн биш');
+    return;
+  }
+  isRecording = true;
+  const btn = document.getElementById('recordBtn');
+  const progressBar = document.getElementById('progressBar');
+  btn.classList.replace('idle', 'recording');
+  btn.textContent = '⏺ Бичиж байна...';
+  btn.disabled = true;
+
+  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+    ? 'audio/webm;codecs=opus' : 'audio/webm';
+  const audioOnly = new MediaStream(stream.getAudioTracks());
+  recorder = new MediaRecorder(audioOnly, { mimeType });
+  const chunks = [];
+  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const filename = `${selectedClass}_${ts}.webm`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    samples[selectedClass]++;
+    updateSamplesList();
+
+    btn.classList.replace('recording', 'idle');
+    btn.textContent = '⏺ Эхлүүлэх';
+    btn.disabled = false;
+    progressBar.style.width = '0%';
+    isRecording = false;
+  };
+
+  recorder.start();
+
+  // 5 second progress
+  const startTime = Date.now();
+  const interval = setInterval(() => {
+    const elapsed = Date.now() - startTime;
+    const pct = Math.min(100, (elapsed / 5000) * 100);
+    progressBar.style.width = pct + '%';
+    if (elapsed >= 5000) {
+      clearInterval(interval);
+      recorder.stop();
+    }
+  }, 50);
+}
+
+function updateSamplesList() {
+  const list = document.getElementById('samplesList');
+  list.innerHTML = Object.entries(samples).map(([cls, count]) =>
+    `<div class="samples-row"><span>${cls}</span><strong>${count} sample${count !== 1 ? 's' : ''}</strong></div>`
+  ).join('');
+}
+
+updateSamplesList();
+initMic();
+</script>
+
+</body>
+</html>

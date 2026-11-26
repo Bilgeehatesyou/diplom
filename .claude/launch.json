@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "student",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/student", "run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "teacher",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/teacher", "run", "dev"],
+      "port": 3001
+    }
+  ]
+}

@@ -10,11 +10,23 @@
 
 body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: #f8f9fb;
-  color: #1a1d23;
+  background: #ffffff;
+  color: #0f172a;
+  letter-spacing: 0.005em;
 }
 
-/* Clean scrollbar */
+html.dark body {
+  background: #0a1124;
+  color: #f1f5f9;
+}
+
+/* UFE style: uppercase + slight tracking for labels, buttons, headers */
+.ufe-caps {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -23,20 +35,21 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #d1d5db;
+  background: #cbd5e1;
   border-radius: 3px;
 }
+html.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+}
 ::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
+  background: #94a3b8;
 }
 
-/* Focus states */
 :focus-visible {
-  outline: 2px solid #2563eb;
+  outline: 2px solid #1543a1;
   outline-offset: 2px;
 }
 
-/* Exam timer — tabular numbers for consistent width */
 .tabular-nums {
   font-variant-numeric: tabular-nums;
   font-feature-settings: 'tnum';

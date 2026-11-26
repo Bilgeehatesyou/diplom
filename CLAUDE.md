@@ -25,7 +25,10 @@ talking) → teacher dashboard shows live video + flagged events. Built for СЭ
 | Student | `B22FA1260` (Г.Билгээ) | `123456` |
 | Teacher | `Tsetsegee` | `123456` |
 
-Plaintext passwords — known weakness, acceptable for diploma. Bcrypt would be a future improvement.
+Passwords are bcrypt-hashed (old plaintext rows auto-migrated on startup). Login returns a JWT (HS256,
+`SECRET_KEY` from `backend/.env`); every teacher REST endpoint requires role=teacher, exam endpoints role=student.
+WebSockets authenticate with a first message `{"type":"auth","token":...}` (not in URL → not in access logs);
+student_id comes from the token, never from the URL.
 
 ## Running
 
@@ -49,13 +52,17 @@ Setup (first time on a new machine):
 
 ## Architecture (must-know files)
 
-- `backend/api/websocket.py` — student & teacher WS endpoints, event pipeline, frame routing, ffmpeg setup, session lifecycle (60s grace on disconnect for reconnect)
-- `backend/api/routes.py` — REST endpoints: login, `/api/dashboard` (teacher rehydrate, current-session events only), `/api/session/.../current`, `/api/report/student/{id}.csv`, `/api/incident/{sid}/{file}` (snapshot serving)
+- `backend/api/websocket.py` — student & teacher WS (token auth), per-student video/audio workers + watchdog, teacher frame queues, background loop (decay, expired-session close, score push)
+- `backend/api/routes.py` — REST: login (JWT), `/api/exam/start|answers|submit` (student), `/api/dashboard`, `/api/session/{id}/submission`, history, CSV, `/api/incident/...` (all teacher-only)
+- `backend/auth.py` — JWT issue/verify, bcrypt, `require_student` / `require_teacher` deps
+- `backend/exam_service.py` — session lifecycle rules (start/resume, finalize, retake policy, server-side deadline)
+- `backend/exams.py` — exam definition (questions, duration) served to the client
 - `backend/ai/analyzer.py` — `analyze_frame` (MediaPipe + YOLO) and `analyze_audio_samples` (VAD + classifier + RMS heuristics)
-- `backend/db.py` — SQLAlchemy models: Student, Teacher, ExamSession, RiskEvent
+- `backend/db.py` — SQLAlchemy models: Student, Teacher, ExamSession (partial unique index: one active per student+exam), RiskEvent (`session_id` FK), Submission; idempotent SQLite migration in `_migrate`
 - `backend/utils/log.py` — colored terminal logging (VAD speech/silence visually distinct)
-- `apps/student/app/exam/page.tsx` — main exam UI, captures video at 10 fps + audio at 2s WebM chunks
-- `apps/teacher/app/page.tsx` — dashboard, binary frame streaming, snapshot thumbnails
+- `apps/student/app/exam/page.tsx` — exam UI: questions/timer from server, autosave, 5 fps 640px frames + 2s WebM audio, fullscreen/focus/copy/virtual-camera reporting
+- `apps/teacher/app/page.tsx` — dashboard, binary frame streaming, server-pushed scores, answers modal; `components/AuthImage.tsx` loads snapshots with the token
+- `apps/*/lib/api.ts` — token storage + authenticated fetch
 
 ## Detection events (severity → risk score)
 
@@ -67,17 +74,24 @@ Setup (first time on a new machine):
 | `object_detected` | high | YOLO sees phone/book/laptop/remote (conf ≥0.65) |
 | `audio_speech` | high | VAD detects 1.5+ sec speech, fires on 1st & every 3rd batch |
 | `audio_whispering` | medium | RMS 0.008–0.05 (quiet speech), needs 2-3 consecutive |
-| `tab_switch` | medium | `visibilitychange` event |
-| `copy_attempt` | low | Copy/paste blocked |
+| `tab_switch` / `fullscreen_exit` | medium | `visibilitychange` / `fullscreenchange` |
+| `focus_lost` / `copy_attempt` | low | window blur / copy-cut-paste |
+| `video_stalled` / `stream_lost` | high | server watchdog: no frame 6s / disconnected 10s+ |
+| `audio_stalled` | medium | server watchdog: no audio 12s |
+| `camera_ended` / `mic_ended` / `mic_denied` / `virtual_camera` | high | browser track/permission/label checks |
 
-Risk score caps at 100 (backend `func.min`), decays 1pt/30sec. Dedup window 10s per event type.
+Points = severity weight (15/7/3) × confidence clamped to 0.5–1.0, capped at 100, decay 1pt/30s — computed
+ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per event type. A classifier
+`audio_talking`/`audio_multiple_voices` event suppresses the generic `audio_speech` in the same batch.
 
 ## Key engineering decisions
 
-- **Session reuse on reconnect:** WS disconnect → 60s grace → if same student reconnects, reuse existing session. Prevents risk score reset on transient network issues.
-- **Fresh login = clean state:** Login endpoint ends any active session for that student. Frontend wipes localStorage answers/timer. New session starts at 0.
+- **Sessions end only by submit or server deadline:** login/refresh/disconnect never end or reset a session (old "fresh login = clean state" was a cheating vector — audit P0-2). Deadline = `started_at + duration`; background loop auto-submits expired sessions (autosaved answers).
+- **Retake policy:** a submitted exam can't be restarted unless the teacher "Цэвэрлэх" (decision=reset) it, or `ALLOW_RETAKE=1`.
+- **One live connection per student:** a second tab replaces the first (close 4000); cleanup only touches its own connection object.
 - **Live video to teacher:** Frame pushed as raw binary blob (no base64 JSON). Teacher writes `URL.createObjectURL(blob)` directly to `<img>.src` via ref — bypasses React re-renders.
-- **Frame routing:** Student sends 10 fps → backend AI throttles to every 10th frame (1 fps for analysis) but forwards every frame to teacher when watching.
+- **Frame routing:** Student sends 5 fps (640px, skips if `bufferedAmount` > 1MB). Receive loop only stores the latest frame; a per-student worker analyzes it at 1 Hz (time-based). Teachers get frames through a `Queue(maxsize=1)` sender task so a slow teacher never stalls students.
+- **Thread safety:** MediaPipe/YOLO/audio models are shared → guarded by locks in `analyzer.py`; FaceMesh uses `static_image_mode=True` so tracking state never leaks between students. ffmpeg decode + snapshot writes run in `asyncio.to_thread`.
 - **Teacher watch/unwatch:** `{action: "watch", student_id}` subscribes to that student's frame stream. `unwatch` releases.
 - **Event buffering:** Events queued (max 100) when teacher offline, replayed on reconnect.
 - **Incident snapshots:** Every flag → JPEG saved to `models/incidents/{student_id}/{ts}_{event}.jpg`. Path stored in DB `snapshot` column. Teacher UI shows thumbnails + click-to-enlarge.
@@ -89,14 +103,14 @@ Risk score caps at 100 (backend `func.min`), decays 1pt/30sec. Dedup window 10s 
 - `_DEDUP_WINDOW_SEC = 10` — same event type within 10s ignored
 - `_DECAY_PER_TICK = 1.0`, `_DECAY_TICK_SEC = 30` — score decay rate
 - Whisper detection: `rms 0.008–0.05`, needs 2-3 consecutive batches
-- AI frame skip: every 10th frame (so face_missing "X seconds" stays in seconds)
+- AI analysis period: `_ANALYSIS_PERIOD = 1.0` s (so face_missing "X seconds" stays in seconds)
+- Watchdog: `_VIDEO_STALL_SEC = 6`, `_AUDIO_STALL_SEC = 12`, `_STREAM_LOST_SEC = 10`
 
 ## Known limitations (for thesis recommendations section)
 
 1. WavLM classifier doesn't generalize to browser audio → retraining with browser-recorded data needed
-2. Plaintext passwords → bcrypt
-3. Single exam (`exam_001`) hardcoded → multi-exam DB schema
-4. Questions hardcoded in `exam/page.tsx` → Exam/Question tables
+2. Single exam (`exam_001`) defined in `backend/exams.py` → multi-exam DB schema (Exam/Question tables)
+3. Gaze has no per-student calibration and no pitch (looking down at lap not detected)
 5. SQLite → PostgreSQL for production scale
 6. No incident snapshot cleanup → auto-delete on `cleared` decision or >30 days old
 7. Some audio false positives (whisper threshold tuning)

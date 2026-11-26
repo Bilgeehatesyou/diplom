@@ -1,5 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
+  darkMode: 'class',
   content: ['./app/**/*.{js,ts,jsx,tsx}', './components/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
@@ -7,17 +8,30 @@ module.exports = {
         sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'sans-serif'],
       },
       colors: {
+        ufe: {
+          50:  '#eaf1ff',
+          100: '#cfdeff',
+          200: '#a1bdff',
+          300: '#6e98ff',
+          400: '#4276ff',
+          500: '#1f57f7',
+          600: '#1543a1',
+          700: '#10368a',
+          800: '#0b285f',
+          900: '#0a1f47',
+        },
         slate: {
-          50: '#f8f9fb',
-          100: '#f1f3f5',
-          200: '#e9ecef',
-          300: '#dee2e6',
-          400: '#ced4da',
-          500: '#adb5bd',
-          600: '#868e96',
-          700: '#495057',
-          800: '#343a40',
-          900: '#1a1d23',
+          50:  '#f8fafc',
+          100: '#f1f5f9',
+          200: '#e2e8f0',
+          300: '#cbd5e1',
+          400: '#94a3b8',
+          500: '#64748b',
+          600: '#475569',
+          700: '#334155',
+          800: '#1e293b',
+          900: '#0f172a',
+          950: '#020617',
         },
       },
       borderRadius: {

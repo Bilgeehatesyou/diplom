@@ -1,4 +1,5 @@
 import asyncio, json, shutil, os, tempfile, time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import cv2, numpy as np
@@ -37,33 +38,126 @@ if _FFMPEG_BIN:
 else:
     log_warn("AUDIO", "ffmpeg олдсонгүй")
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from db import AsyncSessionLocal, RiskEvent, ExamSession
 from ai.analyzer import analyze_frame, analyze_audio_samples, DetectionEvent
+from auth import decode_token
+from exams import DEFAULT_EXAM_ID
+from exam_service import get_active_session, is_expired, finalize_session, close_expired_sessions
 
 router = APIRouter()
 
-# Connection / state maps
-_conns           : dict[str, WebSocket] = {}    # student_id (and "teacher") → WebSocket
-_ctx             : dict[str, dict]      = {}    # per-student AI context
-_audio_bufs      : dict[str, list]      = {}
-_audio_init      : dict[str, bytes]     = {}
-_last_event_at   : dict[str, dict]      = {}    # student_id → {event_type → epoch_seconds}
-_latest_frame    : dict[str, bytes]     = {}    # student_id → latest JPEG bytes (for teacher preview)
-_teacher_buffer  : list                 = []    # events while teacher offline (last 100)
-_teacher_watching: str | None           = None  # which student the teacher is viewing
-_decay_task      : asyncio.Task | None  = None
-
-# Tuning
+# ── Tuning ────────────────────────────────────────────────────────────────────
 _DEDUP_WINDOW_SEC  = 10        # same event type within 10s → skip
 _DECAY_PER_TICK    = 1.0       # points to subtract per tick
 _DECAY_TICK_SEC    = 30        # decay every 30s
+_ANALYSIS_PERIOD   = 1.0       # AI шинжилгээ секундэд 1 удаа (кадрын тоогоор биш, цагаар)
+_VIDEO_STALL_SEC   = 6         # энэ хугацаанд кадр ирэхгүй бол → video_stalled
+_AUDIO_STALL_SEC   = 12        # энэ хугацаанд дуу ирэхгүй бол → audio_stalled
+_STREAM_LOST_SEC   = 10        # салснаас хойш энэ хугацаанд эргэж холбогдохгүй бол → stream_lost
+_SEND_TIMEOUT_SEC  = 2.0       # удаан client бусдыгаа хаахгүй
+_SEVERITY_POINTS   = {"high": 15, "medium": 7, "low": 3}
 _INCIDENTS_DIR     = Path(__file__).resolve().parent.parent.parent / "models" / "incidents"
 _INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Client (browser) талаас мэдээлэх боломжтой event-үүд → (severity, message)
+_CLIENT_EVENTS = {
+    "tab_switch":      ("medium", "Цонх солигдсон"),
+    "fullscreen_exit": ("medium", "Бүтэн дэлгэцээс гарсан"),
+    "focus_lost":      ("low",    "Шалгалтын цонхноос гарсан"),
+    "copy_attempt":    ("low",    "Хуулах/буулгах оролдлого"),
+    "mic_denied":      ("high",   "Микрофон зөвшөөрөгдөөгүй — дуу хянагдахгүй байна"),
+    "mic_ended":       ("high",   "Микрофон салгагдсан"),
+    "camera_ended":    ("high",   "Камер салгагдсан"),
+    "virtual_camera":  ("high",   "Виртуал камер ашиглаж байна"),
+}
 
-async def _decay_loop():
-    """Decay risk_score over time for active sessions."""
+
+class _Peer:
+    """WebSocket + send lock (олон task нэг socket руу зэрэг бичихээс хамгаална)."""
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self._lock = asyncio.Lock()
+
+    async def send_json(self, data: dict) -> bool:
+        return await self._send(text=json.dumps(data, ensure_ascii=False))
+
+    async def send_bytes(self, data: bytes) -> bool:
+        return await self._send(data=data)
+
+    async def _send(self, text: str | None = None, data: bytes | None = None) -> bool:
+        try:
+            async with self._lock:
+                coro = self.ws.send_text(text) if text is not None else self.ws.send_bytes(data)
+                await asyncio.wait_for(coro, timeout=_SEND_TIMEOUT_SEC)
+            return True
+        except Exception:
+            return False
+
+
+class StudentConn(_Peer):
+    def __init__(self, ws: WebSocket, student_id: str, exam_id: str, sess_id: int):
+        super().__init__(ws)
+        self.student_id = student_id
+        self.exam_id    = exam_id
+        self.sess_id    = sess_id
+        self.ctx: dict  = {"frame_no": 0, "face_miss_count": 0, "gaze_away_count": 0}
+        self.audio_init: bytes | None = None
+        self.audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+        self.awaiting_audio = False
+        self.mic_denied     = False
+        self.latest_frame: bytes | None = None
+        self.frame_seq      = 0
+        self.connected_at   = time.monotonic()
+        self.last_frame_at: float | None = None
+        self.last_audio_at: float | None = None
+        self.stalls: set[str] = set()
+        self.tasks: list[asyncio.Task] = []
+
+
+class TeacherConn(_Peer):
+    def __init__(self, ws: WebSocket, name: str):
+        super().__init__(ws)
+        self.name = name
+        self.watching: str | None = None
+        self.frame_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)   # зөвхөн хамгийн сүүлийн кадр
+        self.sender: asyncio.Task | None = None
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+_students       : dict[str, StudentConn] = {}       # student_id → live connection
+_teachers       : set[TeacherConn]       = set()    # олон багш зэрэг холбогдож болно
+_last_event_at  : dict[str, dict]        = {}       # student_id → {event_type → epoch}
+_latest_frame   : dict[str, bytes]       = {}       # student_id → сүүлийн JPEG (offline үед ч snapshot-д)
+_teacher_buffer : deque                  = deque(maxlen=100)   # багш offline үеийн event-үүд
+_bg_task        : asyncio.Task | None    = None
+
+
+def online_students() -> set[str]:
+    return set(_students.keys())
+
+
+async def _authenticate(websocket: WebSocket, role: str, query_token: str) -> dict | None:
+    """Token-ийг эхний мессежээр ({"type":"auth","token":...}) хүлээн авна — URL query-д
+    тавивал uvicorn-ийн access log-д үлддэг. Query token-ийг хэрэгслүүдэд зориулж дэмжинэ."""
+    token = query_token
+    if not token:
+        try:
+            first = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+            msg = json.loads(first)
+            token = msg.get("token", "") if isinstance(msg, dict) and msg.get("type") == "auth" else ""
+        except Exception:
+            token = ""
+    claims = decode_token(token)
+    if not claims or claims["role"] != role:
+        try: await websocket.close(code=4401, reason="unauthorized")
+        except Exception: pass
+        return None
+    return claims
+
+
+# ── Background: decay + expired sessions + score push ─────────────────────────
+async def _background_loop():
     while True:
         try:
             await asyncio.sleep(_DECAY_TICK_SEC)
@@ -71,30 +165,39 @@ async def _decay_loop():
                 await db.execute(
                     update(ExamSession)
                     .where(ExamSession.ended_at.is_(None), ExamSession.risk_score > 0)
-                    .values(risk_score=ExamSession.risk_score - _DECAY_PER_TICK)
+                    .values(risk_score=func.max(ExamSession.risk_score - _DECAY_PER_TICK, 0.0))
                 )
                 await db.commit()
+                rows = (await db.execute(
+                    select(ExamSession.student_id, ExamSession.risk_score)
+                    .where(ExamSession.ended_at.is_(None))
+                )).all()
+            if rows:
+                await _to_teachers_meta({"meta": "scores",
+                                         "scores": {sid: round(score, 1) for sid, score in rows}})
+
+            for sid, sess_id in await close_expired_sessions():
+                log_db(f"Session {sess_id} ({sid}) хугацаа дуусч автоматаар илгээгдлээ")
+                conn = _students.get(sid)
+                if conn and conn.sess_id == sess_id:
+                    await conn.send_json({"type": "exam_ended", "reason": "time_over"})
+                await _to_teachers_meta({"meta": "submitted", "student_id": sid, "auto": True})
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log_err("DECAY", f"алдаа: {e}")
+            log_err("BG", f"алдаа: {e}")
 
 
-def _ensure_decay_started():
-    global _decay_task
-    if _decay_task is None or _decay_task.done():
-        try:
-            loop = asyncio.get_running_loop()
-            _decay_task = loop.create_task(_decay_loop())
-        except RuntimeError:
-            pass
+def _ensure_background_started():
+    global _bg_task
+    if _bg_task is None or _bg_task.done():
+        _bg_task = asyncio.get_running_loop().create_task(_background_loop())
 
 
+# ── Helpers (sync — thread дээр ажиллана) ─────────────────────────────────────
 def _save_incident(student_id: str, event_type: str, frame_bytes: bytes | None):
-    """Persist a JPEG snapshot of the flagged moment for teacher review.
-    Returns a relative path 'student_id/filename.jpg' that maps to /api/incident/..."""
+    """Flag хийгдсэн мөчийн JPEG-ийг хадгална. 'student_id/filename.jpg' буцаана."""
     if not frame_bytes:
-        log_warn("INCIDENT", f"no frame in buffer for {student_id} / {event_type}")
         return None
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -110,28 +213,8 @@ def _save_incident(student_id: str, event_type: str, frame_bytes: bytes | None):
         return None
 
 
-def _should_dedupe(student_id: str, event_type: str) -> bool:
-    """Return True if this event type fired too recently for this student."""
-    now = time.time()
-    last_map = _last_event_at.setdefault(student_id, {})
-    last = last_map.get(event_type, 0.0)
-    if now - last < _DEDUP_WINDOW_SEC:
-        return True
-    last_map[event_type] = now
-    return False
-
-
-async def _process_audio(student_id: str, exam_id: str):
-    buf = _audio_bufs.get(student_id, [])
-    if not buf:
-        return
-    raw = b"".join(buf)
-    _audio_bufs[student_id] = []
-
-    init = _audio_init.get(student_id, b'')
-    if init and raw[:len(init)] != init:
-        raw = init + raw
-
+def _decode_webm(raw: bytes) -> np.ndarray | None:
+    """WebM/Opus → 16kHz mono float32. ffmpeg subprocess тул заавал thread дээр дуудна."""
     tmp_path = None
     try:
         from pydub import AudioSegment
@@ -140,176 +223,288 @@ async def _process_audio(student_id: str, exam_id: str):
             tmp_path = f.name
         audio = AudioSegment.from_file(tmp_path, format="webm")
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        raw_pcm = audio.raw_data
-        audio_arr = np.frombuffer(raw_pcm, np.int16).astype(np.float32) / 32768.0
-        sr = 16000
+        return np.frombuffer(audio.raw_data, np.int16).astype(np.float32) / 32768.0
     except Exception as e:
         log_err("AUDIO", f"Декод алдаа: {e}")
-        return
+        return None
     finally:
         if tmp_path:
             try: os.unlink(tmp_path)
-            except: pass
-
-    events = await asyncio.to_thread(analyze_audio_samples, audio_arr, sr, _ctx[student_id])
-    for ev in events:
-        if _should_dedupe(student_id, ev.event_type):
-            continue
-        await _emit(student_id, exam_id, ev)
+            except OSError: pass
 
 
-async def _emit(student_id: str, exam_id: str, ev: DetectionEvent):
+def _decode_jpeg(jpg: bytes):
+    return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _should_dedupe(student_id: str, event_type: str) -> bool:
+    """Return True if this event type fired too recently for this student."""
+    now = time.time()
+    last_map = _last_event_at.setdefault(student_id, {})
+    if now - last_map.get(event_type, 0.0) < _DEDUP_WINDOW_SEC:
+        return True
+    last_map[event_type] = now
+    return False
+
+
+# ── Event pipeline ────────────────────────────────────────────────────────────
+async def _emit(student_id: str, exam_id: str, sess_id: int, ev: DetectionEvent,
+                frame_no: int = 0, with_snapshot: bool = True):
+    if _should_dedupe(student_id, ev.event_type):
+        return
     d = ev.to_dict()
-    snapshot_path = _save_incident(student_id, ev.event_type, _latest_frame.get(student_id))
+    snapshot_path = None
+    if with_snapshot:
+        snapshot_path = await asyncio.to_thread(
+            _save_incident, student_id, ev.event_type, _latest_frame.get(student_id))
     if snapshot_path:
         d['snapshot'] = snapshot_path
 
-    ws = _conns.get(student_id)
-    if ws:
-        await _safe_send(ws, d)
-    await _log(student_id, exam_id, ev, _ctx[student_id].get("frame_no", 0), snapshot_path)
-    await _to_teacher(student_id, d)
+    score = await _log(sess_id, student_id, exam_id, ev, frame_no, snapshot_path)
+
+    conn = _students.get(student_id)
+    if conn and conn.sess_id == sess_id:
+        await conn.send_json({"type": "event", **{k: d[k] for k in ("event_type", "severity", "message", "timestamp")}})
+    await _to_teachers({"student_id": student_id, "event": d, "risk_score": score})
 
 
-@router.websocket("/ws/student/{student_id}")
-async def student_ws(websocket: WebSocket, student_id: str, exam_id: str = "exam_001"):
-    await websocket.accept()
-    _ensure_decay_started()
-    _conns[student_id] = websocket
-    _ctx[student_id]   = {"frame_no": 0, "face_miss_count": 0, "gaze_away_count": 0}
-    _audio_bufs[student_id] = []
-    _audio_init.pop(student_id, None)
-    _last_event_at[student_id] = {}
-    log_ws(f"✓ Оюутан: {student_id}")
-
-    # Reuse most recent active session (within 30 min) so reconnects don't reset risk
+async def _log(sess_id: int, student_id: str, exam_id: str, ev: DetectionEvent,
+               frame_no: int, snapshot: str | None = None) -> float | None:
+    # Оноо = severity жин × confidence (0.5–1.0 хооронд хязгаарласан) — сул итгэлтэй илрүүлэлт бага оноо авна
+    conf   = ev.confidence if ev.confidence is not None else 1.0
+    points = _SEVERITY_POINTS.get(ev.severity, 0) * min(1.0, max(0.5, conf))
     async with AsyncSessionLocal() as db:
-        existing = (await db.execute(
-            select(ExamSession)
-            .where(ExamSession.student_id == student_id,
-                   ExamSession.exam_id == exam_id,
-                   ExamSession.ended_at.is_(None))
-            .order_by(ExamSession.started_at.desc())
-        )).scalars().first()
-        if existing:
-            sess_id = existing.id
-            log_db(f"Reusing session {sess_id} for {student_id} (risk={existing.risk_score})")
-        else:
-            sess = ExamSession(student_id=student_id, exam_id=exam_id, started_at=datetime.now())
-            db.add(sess)
-            await db.commit()
-            sess_id = sess.id
+        db.add(RiskEvent(session_id=sess_id, student_id=student_id, exam_id=exam_id,
+                         event_type=ev.event_type, severity=ev.severity,
+                         message=ev.message, timestamp=datetime.fromisoformat(ev.timestamp),
+                         frame_no=frame_no, confidence=ev.confidence, snapshot=snapshot))
+        await db.execute(update(ExamSession)
+            .where(ExamSession.id == sess_id, ExamSession.ended_at.is_(None))
+            .values(risk_score=func.min(ExamSession.risk_score + points, 100.0)))
+        await db.commit()
+        score = (await db.execute(
+            select(ExamSession.risk_score).where(ExamSession.id == sess_id))).scalar()
+    from utils.log import C
+    sev_color = {"high": C.BRED, "medium": C.BYELLOW, "low": C.CYAN}.get(ev.severity, C.RESET)
+    log_db(f"{student_id} | {ev.event_type} | {sev_color}{ev.severity}{C.RESET} | conf={ev.confidence}")
+    return round(score, 1) if score is not None else None
 
-    # Notify teacher (UI only, NOT stored in DB)
-    await _to_teacher_meta({"meta": "online", "student_id": student_id})
+
+# ── Per-student workers ───────────────────────────────────────────────────────
+async def _video_worker(conn: StudentConn):
+    """Сүүлийн кадрыг 1 Hz-ээр шинжилнэ. Receive loop-ийг хэзээ ч хаахгүй."""
+    last_seq = 0
+    next_t = time.monotonic()
+    while True:
+        next_t += _ANALYSIS_PERIOD
+        await asyncio.sleep(max(0.0, next_t - time.monotonic()))
+        if conn.frame_seq == last_seq or conn.latest_frame is None:
+            continue
+        last_seq = conn.frame_seq
+        try:
+            frame = await asyncio.to_thread(_decode_jpeg, conn.latest_frame)
+            if frame is None:
+                continue
+            events = await asyncio.to_thread(analyze_frame, frame, conn.ctx)
+            for ev in events:
+                await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_err("AI", f"video worker ({conn.student_id}): {e}")
+        if time.monotonic() - next_t > 5:   # удаан сервер → хуримтлагдахгүй
+            next_t = time.monotonic()
+
+
+async def _audio_worker(conn: StudentConn):
+    """Audio chunk-уудыг thread дээр decode + шинжилнэ (pydub/ffmpeg event loop-ийг хаадаг байсан)."""
+    while True:
+        chunks = [await conn.audio_q.get()]
+        while not conn.audio_q.empty():
+            chunks.append(conn.audio_q.get_nowait())
+        raw = b"".join(chunks)
+        if conn.audio_init and not raw.startswith(conn.audio_init):
+            raw = conn.audio_init + raw
+        try:
+            audio_arr = await asyncio.to_thread(_decode_webm, raw)
+            if audio_arr is None:
+                continue
+            events = await asyncio.to_thread(analyze_audio_samples, audio_arr, 16000, conn.ctx)
+            for ev in events:
+                await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_err("AUDIO", f"audio worker ({conn.student_id}): {e}")
+
+
+async def _watchdog(conn: StudentConn):
+    """Client кадр/дуу илгээхээ зогсоовол (DevTools, камер унтраах) серверт бүртгэнэ."""
+    while True:
+        await asyncio.sleep(2)
+        now = time.monotonic()
+        checks = [("video", conn.last_frame_at, _VIDEO_STALL_SEC, "video_stalled", "high",
+                   "Камерын дүрс {s}с ирээгүй")]
+        if not conn.mic_denied:
+            checks.append(("audio", conn.last_audio_at, _AUDIO_STALL_SEC, "audio_stalled", "medium",
+                           "Микрофоны дуу {s}с ирээгүй"))
+        for key, last, limit, etype, sev, msg in checks:
+            gap = now - (last or conn.connected_at)
+            if gap > limit:
+                if key not in conn.stalls:
+                    conn.stalls.add(key)
+                    ev = DetectionEvent(etype, sev, msg.format(s=int(gap)), 1.0, datetime.now().isoformat())
+                    await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, with_snapshot=False)
+            else:
+                conn.stalls.discard(key)
+
+
+async def _stream_lost_check(student_id: str, exam_id: str, sess_id: int):
+    """Салсан оюутан _STREAM_LOST_SEC дотор эргэж холбогдохгүй бол зөрчил бүртгэнэ."""
+    await asyncio.sleep(_STREAM_LOST_SEC)
+    if student_id in _students:
+        return
+    async with AsyncSessionLocal() as db:
+        sess = (await db.execute(select(ExamSession).where(ExamSession.id == sess_id))).scalar_one_or_none()
+        if sess is None or sess.ended_at is not None:
+            return   # илгээгээд гарсан — хэвийн
+    ev = DetectionEvent("stream_lost", "high",
+                        f"Хяналтын холболт {_STREAM_LOST_SEC}с-ээс удаан тасарсан",
+                        1.0, datetime.now().isoformat())
+    await _emit(student_id, exam_id, sess_id, ev, with_snapshot=False)
+
+
+# ── Student WebSocket ─────────────────────────────────────────────────────────
+@router.websocket("/ws/student")
+async def student_ws(websocket: WebSocket, token: str = "", exam_id: str = DEFAULT_EXAM_ID):
+    await websocket.accept()
+    claims = await _authenticate(websocket, "student", token)
+    if claims is None:
+        return
+    student_id = claims["sub"]           # token-оос — URL-аас биш
+    _ensure_background_started()
+
+    # Session-ийг зөвхөн REST /api/exam/start үүсгэнэ; WS нь идэвхтэйг нь л ашиглана.
+    async with AsyncSessionLocal() as db:
+        sess = await get_active_session(db, student_id, exam_id)
+        if sess is not None and is_expired(sess, 30):
+            await finalize_session(db, sess, auto=True)
+            sess = None
+    if sess is None:
+        await websocket.close(code=4409, reason="no active session")
+        return
+
+    # Нэг оюутны хуучин холболт (өөр tab) байвал хаана — шинэ нь эзэмшинэ.
+    old = _students.get(student_id)
+    if old is not None:
+        await old.send_json({"type": "replaced"})
+        try: await old.ws.close(code=4000, reason="replaced")
+        except Exception: pass
+
+    conn = StudentConn(websocket, student_id, exam_id, sess.id)
+    _students[student_id] = conn
+    log_ws(f"✓ Оюутан: {student_id} (session {sess.id}, risk={sess.risk_score})")
+    conn.tasks = [asyncio.create_task(_video_worker(conn)),
+                  asyncio.create_task(_audio_worker(conn)),
+                  asyncio.create_task(_watchdog(conn))]
+    await _to_teachers_meta({"meta": "online", "student_id": student_id})
+    await conn.send_json({"type": "ready", "session_id": sess.id})
 
     try:
         while True:
             data = await websocket.receive()
+            if data.get("type") == "websocket.disconnect":
+                break
 
-            if "text" in data and data["text"]:
+            if data.get("text"):
                 try:
                     msg = json.loads(data["text"])
-                except:
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
                     continue
                 if msg.get("_audio"):
-                    _ctx[student_id]["_awaiting_audio"] = True
+                    conn.awaiting_audio = True
                     continue
                 etype = msg.get("event")
-                if etype in ("tab_switch", "fullscreen_exit", "copy_attempt"):
-                    if _should_dedupe(student_id, etype):
-                        continue
-                    labels = {"tab_switch": "Цонх солигдсон",
-                              "fullscreen_exit": "Fullscreen-ээс гарсан",
-                              "copy_attempt": "Хуулах оролдлого"}
-                    ev = DetectionEvent(etype,
-                                        "medium" if etype == "tab_switch" else "low",
-                                        labels.get(etype, etype), 1.0,
-                                        datetime.now().isoformat())
-                    await _emit(student_id, exam_id, ev)
+                if etype in _CLIENT_EVENTS:
+                    if etype == "mic_denied":
+                        conn.mic_denied = True
+                    sev, label = _CLIENT_EVENTS[etype]
+                    detail = str(msg.get("detail", ""))[:80]
+                    ev = DetectionEvent(etype, sev, f"{label} ({detail})" if detail else label,
+                                        1.0, datetime.now().isoformat())
+                    await _emit(student_id, exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
 
-            elif "bytes" in data and data["bytes"]:
-                if _ctx[student_id].pop("_awaiting_audio", False):
-                    chunk = data["bytes"]
-                    if student_id not in _audio_init:
-                        if chunk[:4] == b'\x1a\x45\xdf\xa3':
-                            _audio_init[student_id] = chunk
-                        else:
-                            continue
-                    _audio_bufs[student_id].append(chunk)
-                    await _process_audio(student_id, exam_id)
+            elif data.get("bytes"):
+                chunk = data["bytes"]
+                if conn.awaiting_audio:
+                    conn.awaiting_audio = False
+                    if conn.audio_init is None:
+                        if chunk[:4] != b'\x1a\x45\xdf\xa3':
+                            continue            # EBML header-гүй эхний chunk → декод хийх боломжгүй
+                        conn.audio_init = chunk
+                    conn.last_audio_at = time.monotonic()
+                    if conn.audio_q.full():
+                        conn.audio_q.get_nowait()   # сервер хоцорвол хамгийн хуучныг хаяна
+                    conn.audio_q.put_nowait(chunk)
                     continue
 
-                # Video frame
-                frame_bytes = data["bytes"]
-                _latest_frame[student_id] = frame_bytes
-
-                # Push EVERY frame to teacher (smooth video) if watching — binary for speed
-                if _teacher_watching == student_id:
-                    teacher_ws = _conns.get("teacher")
-                    if teacher_ws:
-                        try:
-                            await teacher_ws.send_bytes(frame_bytes)
-                        except: pass
-
-                # Throttle AI analysis to ~1 Hz (every 10th frame at 10 fps)
-                _ctx[student_id]["_rx_count"] = _ctx[student_id].get("_rx_count", 0) + 1
-                if _ctx[student_id]["_rx_count"] % 10 != 0:
-                    continue
-
-                arr   = np.frombuffer(frame_bytes, np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-                events = await asyncio.to_thread(analyze_frame, frame, _ctx[student_id])
-                for ev in events:
-                    if _should_dedupe(student_id, ev.event_type):
-                        continue
-                    await _emit(student_id, exam_id, ev)
+                # Video frame — зөвхөн хадгалаад шууд дараагийнхыг хүлээнэ
+                conn.latest_frame = chunk
+                conn.frame_seq += 1
+                conn.last_frame_at = time.monotonic()
+                _latest_frame[student_id] = chunk
+                for t in _teachers:
+                    if t.watching == student_id:
+                        if t.frame_q.full():
+                            t.frame_q.get_nowait()
+                        t.frame_q.put_nowait(chunk)
 
     except (WebSocketDisconnect, RuntimeError):
-        log_ws(f"Оюутан салсан: {student_id}")
+        pass
     finally:
-        _conns.pop(student_id, None)
-        _audio_bufs.pop(student_id, None)
-        _audio_init.pop(student_id, None)
-        _latest_frame.pop(student_id, None)
-        _last_event_at.pop(student_id, None)
-        await _to_teacher_meta({"meta": "offline", "student_id": student_id})
-        # Don't end the session immediately — give 60s grace period for reconnect.
-        # Session is only finalized if no new WS connection arrives.
-        async def _finalize():
-            await asyncio.sleep(60)
-            if student_id in _conns:
-                return  # student reconnected
-            async with AsyncSessionLocal() as db:
-                await db.execute(
-                    update(ExamSession)
-                    .where(ExamSession.id == sess_id, ExamSession.ended_at.is_(None))
-                    .values(ended_at=datetime.now())
-                )
-                await db.commit()
-            log_db(f"Session {sess_id} ended (grace expired)")
-        asyncio.create_task(_finalize())
+        for t in conn.tasks:
+            t.cancel()
+        # Зөвхөн ӨӨРИЙН бүртгэлийг цэвэрлэнэ (шинэ холболт аль хэдийн орлосон байж болно)
+        if _students.get(student_id) is conn:
+            del _students[student_id]
+            log_ws(f"Оюутан салсан: {student_id}")
+            await _to_teachers_meta({"meta": "offline", "student_id": student_id})
+            asyncio.create_task(_stream_lost_check(student_id, exam_id, conn.sess_id))
+
+
+async def notify_submitted(student_id: str, auto: bool = False):
+    """REST /exam/submit-ээс дуудна: багшид мэдэгдэнэ."""
+    await _to_teachers_meta({"meta": "submitted", "student_id": student_id, "auto": auto})
+
+
+# ── Teacher WebSocket ─────────────────────────────────────────────────────────
+async def _teacher_sender(t: TeacherConn):
+    while True:
+        frame = await t.frame_q.get()
+        await t.send_bytes(frame)
 
 
 @router.websocket("/ws/teacher")
-async def teacher_ws(websocket: WebSocket):
-    global _teacher_watching
+async def teacher_ws(websocket: WebSocket, token: str = ""):
     await websocket.accept()
-    _conns["teacher"] = websocket
-    log_ws("✓ Багш холбогдсон")
+    claims = await _authenticate(websocket, "teacher", token)
+    if claims is None:
+        return
+    _ensure_background_started()
+    t = TeacherConn(websocket, claims.get("name") or claims["sub"])
+    t.sender = asyncio.create_task(_teacher_sender(t))
+    _teachers.add(t)
+    log_ws(f"✓ Багш холбогдсон: {t.name}")
 
-    # Send current online state for all students so UI rehydrates
-    for sid in list(_conns.keys()):
-        if sid != "teacher":
-            await _safe_send(websocket, {"meta": "online", "student_id": sid})
+    for sid in list(_students.keys()):
+        await t.send_json({"meta": "online", "student_id": sid})
 
-    # Flush buffered events from while teacher was offline
     if _teacher_buffer:
         log_ws(f"Replaying {len(_teacher_buffer)} buffered events")
-        for item in _teacher_buffer:
-            await _safe_send(websocket, item)
+        for item in list(_teacher_buffer):
+            await t.send_json(item)
         _teacher_buffer.clear()
 
     try:
@@ -317,92 +512,63 @@ async def teacher_ws(websocket: WebSocket):
             text = await websocket.receive_text()
             try:
                 cmd = json.loads(text)
-            except:
+            except ValueError:
+                continue
+            if not isinstance(cmd, dict):
                 continue
 
             action = cmd.get("action")
             if action == "decide":
-                sid = cmd["student_id"]
-                decision = cmd["decision"]
+                sid, decision = cmd.get("student_id"), cmd.get("decision")
+                if not isinstance(sid, str) or decision not in ("pending", "flagged", "cleared"):
+                    await t.send_json({"error": "invalid decide payload"})
+                    continue
                 async with AsyncSessionLocal() as db:
-                    # Apply to most recent session (active OR ended)
                     latest = (await db.execute(
                         select(ExamSession)
-                        .where(ExamSession.student_id == sid)
+                        .where(ExamSession.student_id == sid,
+                               ExamSession.decision.not_in(("archived", "reset")))
                         .order_by(ExamSession.started_at.desc())
                     )).scalars().first()
                     if latest:
                         values = {"decision": decision}
-                        # Cleared = teacher dismissed all flags as false positives → zero out score
+                        # Cleared = багш бүх flag-ийг false positive гэж үзсэн → оноог тэглэнэ
                         if decision == "cleared":
                             values["risk_score"] = 0.0
                         await db.execute(update(ExamSession)
-                            .where(ExamSession.id == latest.id)
-                            .values(**values))
+                            .where(ExamSession.id == latest.id).values(**values))
                         await db.commit()
-                log_db(f"Шийдвэр: {sid} → {decision}")
-                await _safe_send(websocket, {"ack": "decide",
-                                              "student_id": sid,
-                                              "decision": decision})
+                log_db(f"Шийдвэр ({t.name}): {sid} → {decision}")
+                await t.send_json({"ack": "decide", "student_id": sid, "decision": decision})
 
             elif action == "watch":
                 sid = cmd.get("student_id")
-                _teacher_watching = sid
-                log_ws(f"Багш харж байна: {sid}")
-                # Immediately send latest frame as binary
-                if sid:
-                    jpg = _latest_frame.get(sid)
+                t.watching = sid if isinstance(sid, str) else None
+                if t.watching:
+                    jpg = _latest_frame.get(t.watching)
                     if jpg:
-                        try: await websocket.send_bytes(jpg)
-                        except: pass
+                        await t.send_bytes(jpg)
 
             elif action == "unwatch":
-                _teacher_watching = None
+                t.watching = None
 
     except (WebSocketDisconnect, RuntimeError):
-        log_ws("Багш салсан")
+        pass
     finally:
-        _conns.pop("teacher", None)
-        _teacher_watching = None
+        _teachers.discard(t)
+        if t.sender:
+            t.sender.cancel()
+        log_ws(f"Багш салсан: {t.name}")
 
 
-async def _log(student_id, exam_id, ev: DetectionEvent, frame_no: int, snapshot: str | None = None):
-    from sqlalchemy import func as _func
-    score = {"high": 15, "medium": 7, "low": 3}.get(ev.severity, 0)
-    async with AsyncSessionLocal() as db:
-        db.add(RiskEvent(student_id=student_id, exam_id=exam_id,
-                         event_type=ev.event_type, severity=ev.severity,
-                         message=ev.message, timestamp=datetime.fromisoformat(ev.timestamp),
-                         frame_no=frame_no, confidence=ev.confidence, snapshot=snapshot))
-        # Cap risk_score at 100
-        await db.execute(update(ExamSession)
-            .where(ExamSession.student_id == student_id, ExamSession.ended_at.is_(None))
-            .values(risk_score=_func.min(ExamSession.risk_score + score, 100.0)))
-        await db.commit()
-    from utils.log import C
-    sev_color = {"high": C.BRED, "medium": C.BYELLOW, "low": C.CYAN}.get(ev.severity, C.RESET)
-    log_db(f"{student_id} | {ev.event_type} | {sev_color}{ev.severity}{C.RESET} | conf={ev.confidence}")
+async def _to_teachers(payload: dict):
+    if not _teachers:
+        _teacher_buffer.append(payload)      # багш эргэж холбогдоход replay хийнэ
+        return
+    await asyncio.gather(*(t.send_json(payload) for t in list(_teachers)))
 
 
-async def _to_teacher(sid, d):
-    payload = {"student_id": sid, "event": d}
-    ws = _conns.get("teacher")
-    if ws:
-        await _safe_send(ws, payload)
-    else:
-        # Buffer for replay when teacher reconnects (cap at 100)
-        _teacher_buffer.append(payload)
-        if len(_teacher_buffer) > 100:
-            _teacher_buffer.pop(0)
-
-
-async def _to_teacher_meta(payload: dict):
-    """UI-only signals (online/offline) — never buffered, never stored."""
-    ws = _conns.get("teacher")
-    if ws:
-        await _safe_send(ws, payload)
-
-
-async def _safe_send(ws, data):
-    try: await ws.send_text(json.dumps(data, ensure_ascii=False))
-    except: pass
+async def _to_teachers_meta(payload: dict):
+    """UI-only signals (online/offline/scores) — never buffered, never stored."""
+    if _teachers:
+        await asyncio.gather(*(t.send_json(payload) for t in list(_teachers)))
