@@ -44,6 +44,11 @@ from ai.analyzer import analyze_frame, analyze_audio_samples, DetectionEvent
 from auth import decode_token
 from exams import DEFAULT_EXAM_ID
 from exam_service import get_active_session, is_expired, finalize_session, close_expired_sessions
+from ai import liveness
+from pilot import PILOT_MODE
+
+# Liveness даалгавар: LIVENESS=0-оор унтраана; pilot туршилтын протоколыг алдагдуулахгүйн тулд тэр үед унтарна
+_LIVENESS_ON = os.getenv("LIVENESS", "1") == "1" and not PILOT_MODE
 
 router = APIRouter()
 
@@ -57,8 +62,15 @@ _AUDIO_STALL_SEC   = 12        # энэ хугацаанд дуу ирэхгүй
 _STREAM_LOST_SEC   = 10        # салснаас хойш энэ хугацаанд эргэж холбогдохгүй бол → stream_lost
 _SEND_TIMEOUT_SEC  = 2.0       # удаан client бусдыгаа хаахгүй
 _SEVERITY_POINTS   = {"high": 15, "medium": 7, "low": 3}
-_INCIDENTS_DIR     = Path(__file__).resolve().parent.parent.parent / "models" / "incidents"
+_INCIDENTS_DIR     = Path(os.getenv("INCIDENTS_DIR") or
+                          Path(__file__).resolve().parent.parent.parent / "models" / "incidents")
 _INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ажиллагааны хэмжүүр (/api/metrics, ачааллын тест)
+_METRICS = {"started": time.monotonic(), "frames_rx": 0, "frames_analyzed": 0, "audio_chunks": 0,
+            "audio_analyzed": 0, "audio_dropped": 0, "teacher_frames_dropped": 0, "events": 0}
+_analysis_ms: deque = deque(maxlen=2000)
+_audio_ms: deque = deque(maxlen=2000)
 
 # Client (browser) талаас мэдээлэх боломжтой event-үүд → (severity, message)
 _CLIENT_EVENTS = {
@@ -101,7 +113,7 @@ class StudentConn(_Peer):
         self.student_id = student_id
         self.exam_id    = exam_id
         self.sess_id    = sess_id
-        self.ctx: dict  = {"frame_no": 0, "face_miss_count": 0, "gaze_away_count": 0}
+        self.ctx: dict  = {"frame_no": 0}
         self.audio_init: bytes | None = None
         self.audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
         self.awaiting_audio = False
@@ -113,6 +125,7 @@ class StudentConn(_Peer):
         self.last_audio_at: float | None = None
         self.stalls: set[str] = set()
         self.tasks: list[asyncio.Task] = []
+        self.analyses = 0
 
 
 class TeacherConn(_Peer):
@@ -136,6 +149,34 @@ _bg_task        : asyncio.Task | None    = None
 
 def online_students() -> set[str]:
     return set(_students.keys())
+
+
+def _pct(vals, q: float):
+    if not vals:
+        return None
+    v = sorted(vals)
+    return round(v[min(len(v) - 1, int(q * len(v)))], 1)
+
+
+def metrics_snapshot() -> dict:
+    now = time.monotonic()
+    rates = [c.analyses / max(now - c.connected_at, 1e-6) for c in _students.values()]
+    try:
+        import psutil
+        rss_mb = round(psutil.Process().memory_info().rss / 2**20)
+    except Exception:
+        rss_mb = None
+    return {
+        **{k: v for k, v in _METRICS.items() if k != "started"},
+        "uptime_sec": round(now - _METRICS["started"], 1),
+        "online_students": len(_students),
+        "teachers": len(_teachers),
+        "analysis_ms_p50": _pct(_analysis_ms, 0.5), "analysis_ms_p95": _pct(_analysis_ms, 0.95),
+        "audio_ms_p50": _pct(_audio_ms, 0.5), "audio_ms_p95": _pct(_audio_ms, 0.95),
+        "analyses_per_student_sec_min": round(min(rates), 2) if rates else None,
+        "analyses_per_student_sec_avg": round(sum(rates) / len(rates), 2) if rates else None,
+        "rss_mb": rss_mb,
+    }
 
 
 async def _authenticate(websocket: WebSocket, role: str, query_token: str) -> dict | None:
@@ -253,6 +294,7 @@ async def _emit(student_id: str, exam_id: str, sess_id: int, ev: DetectionEvent,
                 frame_no: int = 0, with_snapshot: bool = True):
     if _should_dedupe(student_id, ev.event_type):
         return
+    _METRICS["events"] += 1
     d = ev.to_dict()
     snapshot_path = None
     if with_snapshot:
@@ -303,10 +345,14 @@ async def _video_worker(conn: StudentConn):
             continue
         last_seq = conn.frame_seq
         try:
+            t0 = time.perf_counter()
             frame = await asyncio.to_thread(_decode_jpeg, conn.latest_frame)
             if frame is None:
                 continue
             events = await asyncio.to_thread(analyze_frame, frame, conn.ctx)
+            _analysis_ms.append((time.perf_counter() - t0) * 1000)
+            _METRICS["frames_analyzed"] += 1
+            conn.analyses += 1
             if conn.ctx.get("gaze_calibrated") and not conn.ctx.get("_calib_notified"):
                 conn.ctx["_calib_notified"] = True
                 _gaze_baselines[conn.sess_id] = conn.ctx["gaze_baseline"]
@@ -331,10 +377,13 @@ async def _audio_worker(conn: StudentConn):
         if conn.audio_init and not raw.startswith(conn.audio_init):
             raw = conn.audio_init + raw
         try:
+            t0 = time.perf_counter()
             audio_arr = await asyncio.to_thread(_decode_webm, raw)
             if audio_arr is None:
                 continue
             events = await asyncio.to_thread(analyze_audio_samples, audio_arr, 16000, conn.ctx)
+            _audio_ms.append((time.perf_counter() - t0) * 1000)
+            _METRICS["audio_analyzed"] += 1
             for ev in events:
                 await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
         except asyncio.CancelledError:
@@ -362,6 +411,38 @@ async def _watchdog(conn: StudentConn):
                     await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, with_snapshot=False)
             else:
                 conn.stalls.discard(key)
+
+
+async def _liveness_worker(conn: StudentConn):
+    """Санамсаргүй цагт "толгойгоо эргүүл" даалгавар өгч, бичлэг/зураг илгээх халдлагыг илрүүлнэ."""
+    first, failed, consecutive, cid = True, False, 0, 0
+    while True:
+        await asyncio.sleep(liveness.next_delay(first, failed))
+        first = False
+        # Зөвхөн калибровк хийгдсэн, кадр урсаж байгаа үед (камергүй бол watchdog аль хэдийн бүртгэнэ)
+        if (not conn.ctx.get("gaze_calibrated") or conn.last_frame_at is None
+                or time.monotonic() - conn.last_frame_at > 3):
+            failed = False
+            continue
+        cid += 1
+        liveness.start(conn.ctx, cid, time.monotonic())
+        await conn.send_json({"type": "liveness", "id": cid, "timeout": liveness.CHALLENGE_TIMEOUT_SEC,
+                              "instruction": "Толгойгоо зүүн эсвэл баруун тийш эргүүлээд буцаана уу"})
+        result = None
+        while result is None:
+            await asyncio.sleep(0.5)
+            result = liveness.evaluate(conn.ctx, time.monotonic())
+        await conn.send_json({"type": "liveness_done", "id": cid, "ok": result == "pass"})
+        if result == "pass":
+            failed, consecutive = False, 0
+            log_ws(f"Liveness ✓ {conn.student_id} (#{cid})")
+            continue
+        failed, consecutive = True, consecutive + 1
+        ev = DetectionEvent("liveness_failed", "high" if consecutive >= 2 else "medium",
+                            "Камерын даалгаврыг биелүүлээгүй — бичлэг/зураг ашигласан байж болзошгүй"
+                            + (f" ({consecutive} дараалан)" if consecutive >= 2 else ""),
+                            1.0, datetime.now().isoformat())
+        await _emit(conn.student_id, conn.exam_id, conn.sess_id, ev, conn.ctx.get("frame_no", 0))
 
 
 async def _stream_lost_check(student_id: str, exam_id: str, sess_id: int):
@@ -417,6 +498,8 @@ async def student_ws(websocket: WebSocket, token: str = "", exam_id: str = DEFAU
     conn.tasks = [asyncio.create_task(_video_worker(conn)),
                   asyncio.create_task(_audio_worker(conn)),
                   asyncio.create_task(_watchdog(conn))]
+    if _LIVENESS_ON:
+        conn.tasks.append(asyncio.create_task(_liveness_worker(conn)))
     await _to_teachers_meta({"meta": "online", "student_id": student_id})
     await conn.send_json({"type": "ready", "session_id": sess.id})
 
@@ -455,8 +538,10 @@ async def student_ws(websocket: WebSocket, token: str = "", exam_id: str = DEFAU
                             continue            # EBML header-гүй эхний chunk → декод хийх боломжгүй
                         conn.audio_init = chunk
                     conn.last_audio_at = time.monotonic()
+                    _METRICS["audio_chunks"] += 1
                     if conn.audio_q.full():
                         conn.audio_q.get_nowait()   # сервер хоцорвол хамгийн хуучныг хаяна
+                        _METRICS["audio_dropped"] += 1
                     conn.audio_q.put_nowait(chunk)
                     continue
 
@@ -464,11 +549,13 @@ async def student_ws(websocket: WebSocket, token: str = "", exam_id: str = DEFAU
                 conn.latest_frame = chunk
                 conn.frame_seq += 1
                 conn.last_frame_at = time.monotonic()
+                _METRICS["frames_rx"] += 1
                 _latest_frame[student_id] = chunk
                 for t in _teachers:
                     if t.watching == student_id:
                         if t.frame_q.full():
                             t.frame_q.get_nowait()
+                            _METRICS["teacher_frames_dropped"] += 1
                         t.frame_q.put_nowait(chunk)
 
     except (WebSocketDisconnect, RuntimeError):
@@ -537,7 +624,8 @@ async def teacher_ws(websocket: WebSocket, token: str = ""):
                     latest = (await db.execute(
                         select(ExamSession)
                         .where(ExamSession.student_id == sid,
-                               ExamSession.decision.not_in(("archived", "reset")))
+                               ExamSession.archived.is_(False),
+                               ExamSession.decision != "reset")
                         .order_by(ExamSession.started_at.desc())
                     )).scalars().first()
                     if latest:

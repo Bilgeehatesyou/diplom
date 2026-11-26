@@ -105,6 +105,17 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 
 `PILOT_MODE=1` (backend/.env) makes `/api/exam/start` return `backend/pilot_protocol.json`; the student exam page shows `components/PilotRunner.tsx` (instructions + beeps) and posts `/api/pilot/mark` per step → `pilot_marks` table (server time = ground truth). `scripts/evaluation/pilot_report.py` matches marks to `risk_events` by session_id → per-detector recall (step-level) / precision (event-level) / F1 with Wilson CI, latency, normal-period false alarms per hour. Guide: `scripts/evaluation/PILOT_GUIDE.md`. Off by default.
 
+## Scalability & ops
+
+- Load test (`scripts/loadtest/ws_load.py`, results `docs/LOAD_TEST.md`): ~10 students at full 1 Hz per process, 20–30 at ~0.8 Hz. YOLO is ~80% of per-frame cost; more threads/processes did not raise the ~15 frames/s ceiling, so YOLO runs every `OBJECT_EVERY`=2 analyses and thresholds are wall-clock (`_sustained` in analyzer).
+- `AI_WORKERS` (default 2) = model pool size (MediaPipe/YOLO/VAD instances); WavLM single instance behind `_clf_lock`.
+- `GET /api/metrics` (teacher): analysis ms p50/p95, per-student analysis rate, dropped audio/frames, RSS.
+- `INCIDENTS_DIR` env overrides snapshot dir (load tests). `LIVENESS=0` disables challenges (auto-off in PILOT_MODE).
+- Liveness (`ai/liveness.py`): random "turn head" challenge 60–180 s after connect then every 4–8 min; pass = |d_yaw| ≥ 20° within 8 s; fail → `liveness_failed` (medium, high if repeated).
+- Login rate limit (`ratelimit.py`): 5 fails per IP+user / 20 per IP in 5 min → 429 for 5 min.
+- Archive is a separate `ExamSession.archived` flag (it used to overwrite `decision`).
+- Tests: `python -m pytest` (39 tests, light deps in `backend/requirements-dev.txt`), CI in `.github/workflows/tests.yml` (pytest + tsc for both apps).
+
 ## Tuning knobs
 
 - `_DEDUP_WINDOW_SEC = 10` — same event type within 10s ignored

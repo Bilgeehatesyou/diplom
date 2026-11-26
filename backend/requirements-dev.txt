@@ -1,0 +1,11 @@
+# Light deps for tests and CI (no torch, mediapipe or ultralytics needed)
+pytest==8.3.3
+numpy>=1.26.4,<2
+opencv-python-headless==4.9.0.80
+fastapi==0.111.0
+sqlalchemy==2.0.30
+aiosqlite==0.20.0
+greenlet>=3.0.0
+python-dotenv==1.0.1
+PyJWT==2.9.0
+bcrypt==4.2.0

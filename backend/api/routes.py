@@ -3,13 +3,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc, update
+from sqlalchemy import select, func, desc, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth import issue_token, verify_password, require_student, require_teacher
+from auth import issue_token, verify_password, hash_password, require_student, require_teacher
+from ratelimit import login_limiter
 from db import get_db, RiskEvent, ExamSession, Student, Teacher, Submission, PilotMark
 from pilot import PILOT_MODE, public_protocol, load_protocol
 from exams import DEFAULT_EXAM_ID, get_exam, public_exam
@@ -17,7 +18,9 @@ from exam_service import (ExamError, SUBMIT_GRACE_SEC, start_or_resume, get_acti
                           get_submission, load_answers, save_answers, finalize_session,
                           is_expired, remaining_sec, deadline_of)
 
-_INCIDENTS_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "incidents"
+import os
+_INCIDENTS_DIR = Path(os.getenv("INCIDENTS_DIR") or
+                      Path(__file__).resolve().parent.parent.parent / "models" / "incidents")
 
 router = APIRouter()
 
@@ -58,21 +61,49 @@ def _online(student_id: str) -> bool:
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+# Бүртгэлгүй нэрээр ч bcrypt шалгалт хийж хугацааг тэнцүүлнэ (хариу хурдаар нэр таахаас хамгаална)
+_DUMMY_HASH = hash_password("timing-equalizer")
+
+
+def _check_limit(request: Request, role: str, username: str) -> str:
+    ip = request.client.host if request.client else "unknown"
+    wait = login_limiter.retry_after(ip, f"{role}:{username}")
+    if wait:
+        raise HTTPException(429, f"Хэт олон буруу оролдлого. {wait} секундын дараа дахин оролдоно уу.",
+                            headers={"Retry-After": str(wait)})
+    return ip
+
+
+def _verify(plain: str, hashed: str | None) -> bool:
+    if hashed is None:
+        verify_password(plain, _DUMMY_HASH)
+        return False
+    return verify_password(plain, hashed)
+
+
 @router.post("/login/student")
-async def login_student(body: StudentLogin, db: AsyncSession = Depends(get_db)):
-    s = (await db.execute(select(Student).where(Student.id == body.student_id.strip()))).scalar_one_or_none()
-    if not s or not verify_password(body.password, s.password):
+async def login_student(body: StudentLogin, request: Request, db: AsyncSession = Depends(get_db)):
+    sid = body.student_id.strip()
+    ip = _check_limit(request, "student", sid)
+    s = (await db.execute(select(Student).where(Student.id == sid))).scalar_one_or_none()
+    if not _verify(body.password, s.password if s else None):
+        login_limiter.fail(ip, f"student:{sid}")
         raise HTTPException(401, "Нэвтрэх мэдээлэл буруу")
+    login_limiter.success(ip, f"student:{sid}")
     # Анхаар: login нь идэвхтэй session-ийг ДУУСГАХГҮЙ — дахин нэвтэрч оноо/таймер reset хийх боломжгүй.
     return {"student_id": s.id, "name": s.name, "department": s.department,
             "token": issue_token(s.id, "student", s.name)}
 
 
 @router.post("/login/teacher")
-async def login_teacher(body: TeacherLogin, db: AsyncSession = Depends(get_db)):
-    t = (await db.execute(select(Teacher).where(Teacher.name == body.name.strip()))).scalar_one_or_none()
-    if not t or not verify_password(body.password, t.password):
+async def login_teacher(body: TeacherLogin, request: Request, db: AsyncSession = Depends(get_db)):
+    name = body.name.strip()
+    ip = _check_limit(request, "teacher", name)
+    t = (await db.execute(select(Teacher).where(Teacher.name == name))).scalar_one_or_none()
+    if not _verify(body.password, t.password if t else None):
+        login_limiter.fail(ip, f"teacher:{name}")
         raise HTTPException(401, "Нэвтрэх мэдээлэл буруу")
+    login_limiter.success(ip, f"teacher:{name}")
     return {"teacher_id": t.id, "name": t.name, "token": issue_token(str(t.id), "teacher", t.name)}
 
 
@@ -185,7 +216,7 @@ async def dashboard(exam_id: str = DEFAULT_EXAM_ID, _=Depends(require_teacher),
 
     sessions_q = (await db.execute(
         select(ExamSession).where(ExamSession.exam_id == exam_id,
-                                  ExamSession.decision != "archived")
+                                  ExamSession.archived.is_(False))
         .order_by(desc(ExamSession.started_at))
     )).scalars().all()
     latest_by_student: dict[str, ExamSession] = {}
@@ -282,8 +313,8 @@ async def archive_all_dashboard(exam_id: str = DEFAULT_EXAM_ID,
         update(ExamSession)
         .where(ExamSession.exam_id == exam_id,
                ExamSession.ended_at.is_not(None),
-               ExamSession.decision != "archived")
-        .values(decision="archived")
+               ExamSession.archived.is_(False))
+        .values(archived=True)          # багшийн шийдвэр (decision) хэвээр үлдэнэ
     )
     await db.commit()
     return {"ok": True, "archived": res.rowcount or 0}
@@ -296,7 +327,8 @@ async def history(exam_id: str = DEFAULT_EXAM_ID, limit: int = 200,
     sessions = (await db.execute(
         select(ExamSession)
         .where(ExamSession.exam_id == exam_id,
-               ExamSession.decision.in_(("archived", "reset", "flagged", "cleared")))
+               or_(ExamSession.archived.is_(True),
+                   ExamSession.decision.in_(("reset", "flagged", "cleared"))))
         .order_by(desc(ExamSession.started_at))
         .limit(min(limit, 1000))
     )).scalars().all()
@@ -324,6 +356,7 @@ async def history(exam_id: str = DEFAULT_EXAM_ID, limit: int = 200,
             "exam_id": sess.exam_id,
             "risk_score": round(sess.risk_score, 1),
             "decision": sess.decision,
+            "archived": sess.archived,
             "started_at": sess.started_at.isoformat() if sess.started_at else None,
             "ended_at": sess.ended_at.isoformat() if sess.ended_at else None,
             "event_count": counts.get(sess.id, 0),
@@ -400,6 +433,14 @@ async def get_incident(student_id: str, filename: str, _=Depends(require_teacher
 @router.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
+
+
+@router.get("/metrics")
+async def metrics(_=Depends(require_teacher)):
+    """Ажиллагааны хэмжүүр: шинжилгээний хугацаа (p50/p95), оюутан бүрийн шинжилгээний давтамж,
+    хаягдсан audio/кадр, санах ой. Ачааллын тест (scripts/loadtest) үүнийг ашиглана."""
+    from api.websocket import metrics_snapshot
+    return metrics_snapshot()
 
 
 @router.get("/logs/{student_id}")

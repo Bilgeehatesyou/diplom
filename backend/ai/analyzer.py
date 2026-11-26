@@ -1,4 +1,8 @@
+import os
+import queue
 import threading
+import time
+from contextlib import contextmanager
 import cv2
 import numpy as np
 from datetime import datetime
@@ -7,30 +11,64 @@ from pathlib import Path
 from utils.log import log_ai, log_vad, log_warn, log_err, log_clf
 from ai.gaze import gaze_step
 from ai import audio_features as af
+from ai import liveness
 
-GAZE_AWAY_SEC    = 3    # дараалсан 3 шинжилгээ (~3с) өөр тийш харвал gaze_away
+FACE_MISSING_SEC = 5    # 5с (бодит цаг) тасралтгүй нүүр алга бол face_missing
+GAZE_AWAY_SEC    = 3    # 3с тасралтгүй өөр тийш харвал gaze_away
 LOOKING_DOWN_SEC = 15   # 15с тасралтгүй доош харвал looking_down (low)
+OBJECT_EVERY     = max(1, int(os.getenv("OBJECT_EVERY", "2")))   # YOLO-г хэдэн шинжилгээ тутамд
 
 CLF_WINDOW_SEC         = 5    # классификаторт өгөх гүйдэг цонх (сургалтын клипийн урт)
 SPEECH_HIST_CHUNKS     = 3    # ~6с (2с chunk × 3)
 SHORT_SPEECH_SEC       = 1.0  # үүнээс богино яриа = "аан", ханиалга, шивнээ
 SUSTAINED_SPEECH_RATIO = 0.4  # сүүлийн ~6с-ийн 40%+ нь яриа бол тасралтгүй яриа (high)
 
-# Загварууд бүх оюутанд нэг instance → thread-safe биш. asyncio.to_thread-ээс зэрэг
-# дуудагддаг тул тус бүрд lock. (Оюутан бүрт тусдаа instance нь санах ой их зарцуулна.)
-_mp_lock    = threading.Lock()
-_yolo_lock  = threading.Lock()
-_audio_lock = threading.Lock()   # Silero VAD (stateful) + WavLM
+# ── Загварын pool ─────────────────────────────────────────────────────────────
+# MediaPipe / YOLO / Silero VAD нь thread-safe биш. Өмнө нь нэг instance + lock ашигладаг байсан тул
+# бүх оюутны шинжилгээ дараалан хийгдэж, CPU ~15% ачаалалтай үед 10+ оюутанд хоцордог байв
+# (scripts/loadtest). Одоо AI_WORKERS ширхэг instance-ийн pool: нэг instance-ийг нэг thread ашиглана,
+# өөр өөр оюутны кадр зэрэгцээ шинжлэгдэнэ.
+# Хэмжилтээр (scripts/loadtest) 2-оос дээш instance нь бараг ашиггүй: YOLO аль хэдийн олон цөм
+# ашигладаг тул нийт багтаамж ~15 кадр/с-д тулдаг. 2 нь санах ой/хурдны сайн тэнцвэр.
+AI_WORKERS = int(os.getenv("AI_WORKERS") or 2)
+
+
+class _Pool:
+    def __init__(self, items: list):
+        self._q: queue.Queue = queue.Queue()
+        for it in items:
+            self._q.put(it)
+        self.size = len(items)
+
+    @contextmanager
+    def acquire(self):
+        item = self._q.get()
+        try:
+            yield item
+        finally:
+            self._q.put(item)
+
+
+_clf_lock = threading.Lock()     # WavLM (~380MB) нэг л instance — зөвхөн яриа илэрсэн үед ажиллана
+
+try:
+    import torch as _torch_threads
+    # Pool-ийн instance бүр PyTorch-ийн бүх цөмийг булаалдахгүйн тулд thread-ийг хуваана
+    _torch_threads.set_num_threads(max(2, (os.cpu_count() or 4) // AI_WORKERS))
+except Exception:
+    pass
 
 try:
     import mediapipe as mp
-    _face_det  = mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6)
     # static_image_mode=True: кадр бүрийг бие даан шинжилнэ → нэг оюутны tracking төлөв
     # нөгөө оюутны кадр руу шилжихгүй (1 Hz шинжилгээнд tracking ач холбогдолгүй).
-    _face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=2,
-                     refine_landmarks=True, min_detection_confidence=0.6)
+    _mp_pool = _Pool([
+        (mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6),
+         mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=2,
+                                         refine_landmarks=True, min_detection_confidence=0.6))
+        for _ in range(AI_WORKERS)])
     MP_OK = True
-    log_ai("MediaPipe ✓")
+    log_ai(f"MediaPipe ✓ (pool {AI_WORKERS})")
 except Exception as e:
     MP_OK = False
     log_err("AI", f"MediaPipe алдаа: {e}")
@@ -38,9 +76,12 @@ except Exception as e:
 try:
     from ultralytics import YOLO
     _yolo_path = Path(__file__).resolve().parent.parent / "yolov8n.pt"   # CWD-ээс хамаарахгүй
-    _yolo   = YOLO(str(_yolo_path) if _yolo_path.exists() else "yolov8n.pt")
+    _yolo_pool = _Pool([YOLO(str(_yolo_path) if _yolo_path.exists() else "yolov8n.pt")
+                        for _ in range(AI_WORKERS)])
+    with _yolo_pool.acquire() as _y:
+        _yolo = _y                       # ангиллын нэр (names) унших зориулалттай
     YOLO_OK = True
-    log_ai("YOLOv8 ✓")
+    log_ai(f"YOLOv8 ✓ (pool {AI_WORKERS})")
 except Exception as e:
     _yolo   = None
     YOLO_OK = False
@@ -81,8 +122,9 @@ except Exception as e:
 
 try:
     from silero_vad import load_silero_vad, get_speech_timestamps
-    _vad_model = load_silero_vad()
-    log_ai("Silero VAD ✓")
+    _vad_pool  = _Pool([load_silero_vad() for _ in range(AI_WORKERS)])   # stateful → instance бүр тусдаа
+    _vad_model = True                    # байгаа эсэхийн туг
+    log_ai(f"Silero VAD ✓ (pool {AI_WORKERS})")
 except Exception as e:
     log_err("AI", f"Silero VAD алдаа: {e}")
 
@@ -99,8 +141,7 @@ def analyze_audio_samples(audio_samples: np.ndarray, sample_rate: int = 16000,
     ctx: student context dict
     Returns list of DetectionEvent objects.
     """
-    with _audio_lock:
-        events = _analyze_audio_impl(audio_samples, sample_rate, ctx)
+    events = _analyze_audio_impl(audio_samples, sample_rate, ctx)
     # Classifier нь яриаг илүү нарийн ангилсан бол ерөнхий VAD "audio_speech"-ийг давхар тооцохгүй
     if any(e.event_type in ("audio_talking", "audio_multiple_voices") for e in events):
         events = [e for e in events if e.event_type not in ("audio_speech", "audio_short_speech")]
@@ -130,7 +171,8 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
         try:
             import torch as _torch
             _t = _torch.tensor(audio_samples)
-            speech_timestamps = get_speech_timestamps(_t, _vad_model, sampling_rate=sample_rate)
+            with _vad_pool.acquire() as vad:
+                speech_timestamps = get_speech_timestamps(_t, vad, sampling_rate=sample_rate)
             is_speech   = len(speech_timestamps) > 0
             speech_prob = 1.0 if is_speech else 0.0
             rms = float(np.sqrt(np.mean(audio_samples**2)))
@@ -236,7 +278,7 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
                 truncation=True,
                 padding="max_length",
             )
-            with torch.no_grad():
+            with _clf_lock, torch.no_grad():
                 logits = _clf_model(**inputs).logits
             probs     = torch.softmax(logits, dim=-1)[0].cpu().numpy()
             pred_id   = int(probs.argmax())
@@ -285,6 +327,14 @@ def _analyze_audio_impl(audio_samples: np.ndarray, sample_rate: int = 16000,
     return events
 
 FORBIDDEN_OBJECTS = {"cell phone", "book", "laptop", "remote"}
+# Багшид харагдах нэр. YOLO (COCO) гар утсыг ихэвчлэн "remote" гэж андуурдаг (pilot туршилтаар
+# ажиглагдсан), тиймээс "remote"-ийг утас төстэй объект гэж харуулна.
+OBJECT_LABELS_MN = {
+    "cell phone": "Гар утас",
+    "book":       "Ном/дэвтэр",
+    "laptop":     "Зөөврийн компьютер",
+    "remote":     "Утас төстэй объект",
+}
 
 @dataclass
 class DetectionEvent:
@@ -295,27 +345,43 @@ class DetectionEvent:
     timestamp  : str
     def to_dict(self): return asdict(self)
 
+def _sustained(ctx: dict, key: str, active: bool, min_sec: float, now_t: float) -> float | None:
+    """Нөхцөл min_sec-ээс удаан ТАСРАЛТГҮЙ үргэлжилбэл (бодит цагаар) үргэлжилсэн хугацааг буцаана;
+    дараа нь min_sec тутамд дахин. Өмнө нь кадрын тоогоор тоолдог байсан тул сервер ачааллаас болж
+    секундэд 1-ээс цөөн кадр шинжилбэл "5 секунд" нь бодитоор 10 секунд болдог байв."""
+    since_k, fired_k = f"_{key}_since", f"_{key}_fired"
+    if not active:
+        ctx.pop(since_k, None)
+        ctx.pop(fired_k, None)
+        return None
+    elapsed = now_t - ctx.setdefault(since_k, now_t)
+    if elapsed < min_sec:
+        return None
+    last = ctx.get(fired_k)
+    if last is None or now_t - last >= min_sec:
+        ctx[fired_k] = now_t
+        return elapsed
+    return None
+
+
 def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
     events = []
     now    = datetime.now().isoformat()
+    now_t  = time.monotonic()
     if frame is None or frame.size == 0:
         return events
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     # 1. Нүүр
     if MP_OK:
-        with _mp_lock:
-            faces = (_face_det.process(rgb).detections or [])
-            mesh  = _face_mesh.process(rgb)
+        with _mp_pool.acquire() as (face_det, face_mesh):
+            faces = (face_det.process(rgb).detections or [])
+            mesh  = face_mesh.process(rgb)
         n     = len(faces)
-        if n == 0:
-            ctx["face_miss_count"] = ctx.get("face_miss_count", 0) + 1
-            m = ctx["face_miss_count"]
-            if m >= 5 and m % 5 == 0:
-                events.append(DetectionEvent("face_missing","high",
-                    f"Нүүр кадраас {m} секунд гарсан", 0.95, now))
-        else:
-            ctx["face_miss_count"] = 0
+        missing_for = _sustained(ctx, "face_missing", n == 0, FACE_MISSING_SEC, now_t)
+        if missing_for is not None:
+            events.append(DetectionEvent("face_missing","high",
+                f"Нүүр кадраас {missing_for:.0f} секунд гарсан", 0.95, now))
 
         # 2. Олон хүн (multi-frame voting: 2 of last 3 frames must agree)
         mf_hist = ctx.setdefault("_mfaces_history", [])
@@ -341,31 +407,27 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
             h, w = frame.shape[:2]
             g = gaze_step(lm, w, h, ctx)
 
-            if g["state"] == "tracking":
-                if g["away"]:
-                    ctx["gaze_away_count"] = ctx.get("gaze_away_count", 0) + 1
-                    n_away = ctx["gaze_away_count"]
-                    if n_away >= GAZE_AWAY_SEC and n_away % GAZE_AWAY_SEC == 0:
-                        events.append(DetectionEvent("gaze_away", "medium",
-                            f"Дэлгэцээс {n_away}с өөр тийш харсан ({g['reason']})",
-                            g["conf"], now))
-                else:
-                    ctx["gaze_away_count"] = 0
+            if g["state"] == "tracking" and liveness.active(ctx):
+                # Liveness даалгавар биелүүлж буй үед толгой эргүүлэх нь хүлээгдэж буй үйлдэл
+                liveness.observe(ctx, g["d_yaw"])
+                _sustained(ctx, "gaze", False, GAZE_AWAY_SEC, now_t)
+            elif g["state"] == "tracking":
+                away_for = _sustained(ctx, "gaze", g["away"], GAZE_AWAY_SEC, now_t)
+                if away_for is not None:
+                    events.append(DetectionEvent("gaze_away", "medium",
+                        f"Дэлгэцээс {away_for:.0f}с өөр тийш харсан ({g['reason']})",
+                        g["conf"], now))
 
                 # Доош харах нь (бичих, бодох) хэвийн → зөвхөн удаан үргэлжилбэл low
-                if g["down"]:
-                    ctx["_looking_down_now"] = True
-                    ctx["down_count"] = ctx.get("down_count", 0) + 1
-                    n_down = ctx["down_count"]
-                    if n_down >= LOOKING_DOWN_SEC and n_down % LOOKING_DOWN_SEC == 0:
-                        events.append(DetectionEvent("looking_down", "low",
-                            f"{n_down}с доош харж байна (доош {g['d_pitch']:.0f}°)",
-                            0.5, now))
-                else:
-                    ctx["down_count"] = 0
+                ctx["_looking_down_now"] = bool(g["down"])
+                down_for = _sustained(ctx, "down", g["down"], LOOKING_DOWN_SEC, now_t)
+                if down_for is not None:
+                    events.append(DetectionEvent("looking_down", "low",
+                        f"{down_for:.0f}с доош харж байна (доош {g['d_pitch']:.0f}°)",
+                        0.5, now))
         else:
-            ctx["gaze_away_count"] = 0
-            ctx["down_count"] = 0
+            _sustained(ctx, "gaze", False, GAZE_AWAY_SEC, now_t)
+            _sustained(ctx, "down", False, LOOKING_DOWN_SEC, now_t)
 
     # 4. Объект (per-object threshold + multi-frame voting)
     # Гар утас бол хамгийн чухал → илүү мэдрэмжтэй (бага босготой)
@@ -383,12 +445,15 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
         "remote":     0.75,
     }
 
-    if YOLO_OK and _yolo:
+    # YOLO нь шинжилгээний ~80%-ийг эзэлдэг тул OBJECT_EVERY шинжилгээ тутамд нэг удаа (default 2 → ~0.5 Hz).
+    # Утас/ном хэдэн секунд харагддаг тул илрүүлэлтэд бага нөлөөтэй, харин серверийн багтаамж ~1.7 дахин өснө.
+    run_yolo = ctx.get("frame_no", 0) % OBJECT_EVERY == 0
+    if YOLO_OK and _yolo and run_yolo:
         obj_hist = ctx.setdefault("_obj_history", {})
         seen_this_frame = {}
         # YOLO conf=0.30 — олон candidate барих, дараа нь өөрсдөө filter хийнэ
-        with _yolo_lock:
-            results = _yolo.predict(frame, conf=0.30, verbose=False)
+        with _yolo_pool.acquire() as yolo:
+            results = yolo.predict(frame, conf=0.30, verbose=False)
         for r in results:
             for box in r.boxes:
                 name = _yolo.names[int(box.cls)]
@@ -419,13 +484,15 @@ def analyze_frame(frame: np.ndarray, ctx: dict) -> list:
                 if cur - last > 10:
                     ctx[f"last_{obj_name}"] = cur
                     events.append(DetectionEvent("object_detected","high",
-                        f'"{obj_name}" объект илэрлээ',
+                        f"{OBJECT_LABELS_MN.get(obj_name, obj_name)} илэрлээ ({obj_name})",
                         round(cur_conf, 2), now))
 
         # Хосолсон нотолгоо: доош харж байх үед утасны сул (≥0.30) илрүүлэлт ч хангалттай —
         # өвөр дээрх утас ихэвчлэн кадрын доод ирмэгт хэсэгчлэн л харагддаг.
-        phone_conf = seen_this_frame.get("cell phone", 0.0)
-        already = any(e.event_type == "object_detected" and "cell phone" in e.message for e in events)
+        # "remote"-ийг утас гэж тооцно (YOLO утсыг ихэвчлэн remote гэж андуурдаг)
+        phone_conf = max(seen_this_frame.get("cell phone", 0.0), seen_this_frame.get("remote", 0.0))
+        already = any(e.event_type == "object_detected"
+                      and ("(cell phone)" in e.message or "(remote)" in e.message) for e in events)
         if ctx.get("_looking_down_now") and phone_conf > 0 and not already:
             last = ctx.get("_last_down_phone", -999)
             cur  = ctx.get("frame_no", 0)

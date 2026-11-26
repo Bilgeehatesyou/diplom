@@ -112,6 +112,7 @@ const EVENT_LABEL: Record<string, string> = {
   mic_ended: 'Микрофон салсан',
   camera_ended: 'Камер салсан',
   virtual_camera: 'Виртуал камер',
+  liveness_failed: 'Камерын даалгавар биелүүлээгүй',
 }
 
 function EventIcon({ type }: { type: string }) {

@@ -107,5 +107,9 @@ def run():
     return passed == len(checks)
 
 
+def test_pilot_report_metrics():
+    assert run()
+
+
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)

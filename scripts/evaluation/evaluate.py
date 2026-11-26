@@ -19,7 +19,7 @@ from datetime import datetime
 REPO_ROOT     = Path(__file__).resolve().parent.parent.parent
 LABELS_PATH   = Path(__file__).resolve().parent / "vision_labels.json"
 AUDIO_DIR     = Path(__file__).resolve().parent / "audio_samples"
-REPORT_PATH   = REPO_ROOT / "EVALUATION_REPORT.md"
+REPORT_PATH   = Path(__file__).resolve().parent / "results" / "labeled_precision_report.md"
 INCIDENTS_DIR = REPO_ROOT / "models" / "incidents"
 
 EVENT_RE = re.compile(r"^\d+_\d+_\d+_(.+)\.jpg$")
@@ -315,5 +315,6 @@ if __name__ == "__main__":
         print("  (audio дээж олдсонгүй — алхамыг алгасав)")
 
     report = render_report(vision, audio)
-    REPORT_PATH.write_text(report)
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_PATH.write_text(report, encoding="utf-8")
     print(f"\n✅ Тайлан бэлэн: {REPORT_PATH}")

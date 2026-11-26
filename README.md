@@ -20,6 +20,9 @@
    # Сонголттой:
    # EXAM_DURATION_SEC=3000      # шалгалтын хугацаа (default 50 мин)
    # ALLOW_RETAKE=1              # demo үед илгээсэн шалгалтыг дахин өгөхийг зөвшөөрөх
+   # LIVENESS=0                  # санамсаргүй "толгойгоо эргүүл" даалгаврыг унтраах
+   # AI_WORKERS=2                # загварын pool-ийн хэмжээ
+   # OBJECT_EVERY=2              # YOLO-г хэдэн шинжилгээ тутамд ажиллуулах
    # CORS_ORIGINS=http://my-host:3000
    ```
    `SECRET_KEY` байхгүй бол сервер түр түлхүүр үүсгэнэ (restart бүрд дахин нэвтрэх шаардлагатай).
@@ -46,6 +49,17 @@ Docker: `SECRET_KEY=... docker-compose up`
 3. Хариулт автоматаар серверт хадгалагдана (`PUT /api/exam/answers`); refresh, дахин нэвтрэх, сүлжээ тасрах нь оноо/таймерыг reset хийхгүй.
 4. `POST /api/exam/submit` эсвэл хугацаа дуусахад сервер session-ийг хаана. Илгээсэн шалгалтыг дахин өгөхийн тулд багш "Цэвэрлэх" хийнэ.
 
+## Баримт бичиг
+- `docs/ARCHITECTURE.md` — архитектур, sequence, төлөв, ER диаграмм, аюулгүй байдлын давхаргууд
+- `docs/LOAD_TEST.md` — ачааллын тест (нэг процесс ~10 оюутан бүрэн 1 Hz, 30 хүртэл ~0.8 Hz)
+- `EVALUATION_REPORT.md` — үнэлгээний нэгдсэн тайлан (юуг хэмжсэн / хэмжээгүй)
+
+## Тест
+```bash
+pip install -r backend/requirements-dev.txt
+python -m pytest          # GitHub Actions мөн автоматаар ажиллуулна
+```
+
 ## Pilot үнэлгээ
 `backend/.env`-д `PILOT_MODE=1` тавьж туршилт хийнэ — дэлгэрэнгүйг `scripts/evaluation/PILOT_GUIDE.md`.
 Детектор бүрийн Recall / Precision / F1, хоцролт, цагт ногдох худал дохиоллыг `scripts/evaluation/pilot_report.py` гаргана.
@@ -64,6 +78,7 @@ Docker: `SECRET_KEY=... docker-compose up`
 | video_stalled / stream_lost | high | Серверийн watchdog (кадр 6с ирэхгүй / холболт 10с+ тасрах) |
 | audio_stalled | medium | Серверийн watchdog |
 | camera_ended, mic_ended, mic_denied, virtual_camera | high | Browser |
+| liveness_failed | medium → high (давтагдвал) | Санамсаргүй "толгойгоо эргүүл" даалгаврыг биелүүлээгүй (бичлэг/зураг) |
 | tab_switch, fullscreen_exit | medium | Browser |
 | focus_lost, copy_attempt | low | Browser |
 

@@ -70,7 +70,7 @@ def main():
         dst_dir.mkdir(parents=True, exist_ok=True)
 
         # Хуучин synthetic augment файлуудыг арилгах
-        for old in dst_dir.glob("aug_multiple_*.webm"):
+        for old in dst_dir.glob("*aug_multiple_*.webm"):
             old.unlink()
         for old in dst_dir.glob("real_*.webm"):
             old.unlink()

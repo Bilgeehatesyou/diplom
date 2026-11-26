@@ -23,6 +23,9 @@ import sys
 import shutil
 import tempfile
 from pathlib import Path
+import json
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from audio_split import group_split, load_manifest  # noqa: E402
 
 import numpy as np
 import torch
@@ -179,20 +182,16 @@ def main():
     )
     print(f"\n⚖ Class weights: {dict(zip(LABELS, weights.tolist()))}")
 
-    # 4. Train/val split (80/20 stratified)
-    print(f"\n🔀 Train/val split...")
-    by_class = {l: [] for l in range(len(LABELS))}
-    for i, lbl_id in enumerate(labels):
-        by_class[lbl_id].append(i)
-    train_idx, val_idx = [], []
-    rng = np.random.default_rng(42)
-    for cls_id, idxs in by_class.items():
-        if not idxs:
-            continue
-        rng.shuffle(idxs)
-        n_val = max(1, len(idxs) // 5)
-        val_idx.extend(idxs[:n_val])
-        train_idx.extend(idxs[n_val:])
+    # 4. Train/val split — leakage-гүй (scripts/audio_split.py): эх бичлэгийг эхэлж хувааж,
+    #    synthetic mix-ийг эхийнх нь талд оруулна; холимог mix-ийг хасна.
+    print(f"\n🔀 Train/val split (mode={ARGS.split})...")
+    manifest = load_manifest(TRAIN_DIR)
+    if counts.get("multiple") and not manifest:
+        print("   ⚠ aug_manifest.json олдсонгүй — augment_multiple_audio.py-г дахин ажиллуулна уу "
+              "(эсвэл бүх multiple дээж бодит бичлэг бол үргэлжилнэ)")
+    train_idx, val_idx, split_report = group_split([f.name for f in files], labels, manifest,
+                                                   mode=ARGS.split, val_frac=0.2, seed=42)
+    print(f"   {split_report}")
 
     train_files  = [files[i]  for i in train_idx]
     train_labels = [labels[i] for i in train_idx]
@@ -208,7 +207,7 @@ def main():
         output_dir=str(TARGET_MODEL),
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
-        num_train_epochs=8,
+        num_train_epochs=ARGS.epochs,
         learning_rate=2e-5,
         warmup_ratio=0.1,
         eval_strategy="epoch",
@@ -234,11 +233,34 @@ def main():
     print(f"\n🚀 Training эхэллээ... (epochs={args.num_train_epochs})")
     trainer.train()
 
-    # 6. Validation
+    # 6. Validation — ангилал тус бүрийн P/R/F1 + confusion matrix (дипломд оруулах тоо)
     print(f"\n✅ Validation үр дүн:")
     metrics = trainer.evaluate()
     for k, v in metrics.items():
         print(f"   {k:20} {v:.4f}")
+    pred = trainer.predict(val_ds)
+    y_pred = pred.predictions.argmax(-1).tolist()
+    y_true = val_labels
+    k = len(LABELS)
+    cm = [[0] * k for _ in range(k)]
+    for t, p in zip(y_true, y_pred):
+        cm[t][p] += 1
+    per_class = {}
+    for i, lbl in enumerate(LABELS):
+        tp = cm[i][i]
+        fp = sum(cm[r][i] for r in range(k)) - tp
+        fn = sum(cm[i]) - tp
+        prec = tp / (tp + fp) if tp + fp else None
+        rec = tp / (tp + fn) if tp + fn else None
+        f1 = 2 * prec * rec / (prec + rec) if prec and rec else None
+        per_class[lbl] = {"support": sum(cm[i]), "precision": prec, "recall": rec, "f1": f1}
+    acc = sum(cm[i][i] for i in range(k)) / max(1, len(y_true))
+    print(f"\n   accuracy {acc:.3f}  (val={len(y_true)}, split={ARGS.split})")
+    print("   confusion (мөр=бодит, багана=таамаг): " + " ".join(LABELS))
+    for i, lbl in enumerate(LABELS):
+        print(f"   {lbl:11} {cm[i]}")
+    report = {"split": split_report, "accuracy": acc, "labels": LABELS,
+              "confusion": cm, "per_class": per_class, "val_files": [f.name for f in val_files]}
 
     # 7. Save (label mapping-ийг production-той ижил болгох)
     print(f"\n💾 Хадгалж байна: {TARGET_MODEL}")
@@ -246,6 +268,9 @@ def main():
     model.config.label2id = {v: k for k, v in model.config.id2label.items()}
     trainer.save_model(str(TARGET_MODEL))
     extractor.save_pretrained(str(TARGET_MODEL))
+    (TARGET_MODEL / "eval_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                                                   encoding="utf-8")
+    print(f"   eval_report.json хадгалагдлаа")
 
     print(f"\n🎉 Бэлэн! Production-д ашиглах:")
     print(f"   1. backend/ai/analyzer.py-н _CLF_MODEL_DIR-ийг 'cheating_classifier_v3' болгох")
@@ -253,4 +278,10 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--split", choices=["random", "mic"], default="random",
+                    help="random: эх бичлэгээр 80/20; mic: computer mic-ээр сургаж webcam mic дээр шалгана")
+    ap.add_argument("--epochs", type=int, default=8)
+    ARGS = ap.parse_args()
     main()

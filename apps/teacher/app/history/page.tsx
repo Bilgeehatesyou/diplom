@@ -80,6 +80,7 @@ function decisionBadge(decision: string) {
     case 'cleared':  return { label: 'Зөрчилгүй',    cls: 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-900/40' }
     case 'reset':    return { label: 'Цэвэрлэгдсэн', cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700' }
     case 'archived': return { label: 'Архивласан',   cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700' }
+    case 'pending':  return { label: 'Шийдвэргүй',   cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700' }
     default:         return { label: decision,       cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700' }
   }
 }

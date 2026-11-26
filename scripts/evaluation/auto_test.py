@@ -20,7 +20,7 @@ from datetime import datetime
 
 REPO_ROOT     = Path(__file__).resolve().parent.parent.parent
 INCIDENTS_DIR = REPO_ROOT / "models" / "incidents"
-REPORT_PATH   = REPO_ROOT / "EVALUATION_REPORT.md"
+REPORT_PATH   = Path(__file__).resolve().parent / "results" / "auto_test_report.md"   # тойрог арга — дипломын тоо биш
 EVENT_RE      = re.compile(r"^\d+_\d+_\d+_(.+)\.jpg$")
 
 # Load the analyzer + dependencies
@@ -323,5 +323,6 @@ if __name__ == "__main__":
     print(f"  binary VAD accuracy: {pct(audio['binary']['accuracy'])}")
 
     report = render_report(vision_v, neg, audio)
-    REPORT_PATH.write_text(report)
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_PATH.write_text(report, encoding="utf-8")
     print(f"\n✅ Тайлан бэлэн: {REPORT_PATH}")

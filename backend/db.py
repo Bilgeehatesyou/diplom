@@ -50,7 +50,9 @@ class ExamSession(Base):
     started_at : Mapped[datetime]       = mapped_column(DateTime, default=func.now())
     ended_at   : Mapped[datetime|None]  = mapped_column(DateTime, nullable=True)
     risk_score : Mapped[float]          = mapped_column(Float, default=0.0)
-    decision   : Mapped[str]            = mapped_column(String(16), default="pending")
+    decision   : Mapped[str]            = mapped_column(String(16), default="pending")   # pending|flagged|cleared|reset
+    # Архив нь шийдвэрээс тусдаа: өмнө нь decision="archived" болгож багшийн шийдвэрийг дарж бичдэг байсан
+    archived   : Mapped[bool]           = mapped_column(Boolean, default=False)
 
     # Нэг оюутан нэг шалгалтад зөвхөн НЭГ идэвхтэй session-тэй байна (race condition-оос хамгаална).
     __table_args__ = (
@@ -104,6 +106,13 @@ async def _migrate(conn):
     """Хуучин aiproctor.db-г шинэ schema руу шилжүүлэх (SQLite, idempotent)."""
     if not DATABASE_URL.startswith("sqlite"):
         return
+    scols = {r[1] for r in (await conn.exec_driver_sql("PRAGMA table_info(exam_sessions)")).fetchall()}
+    if "archived" not in scols:
+        await conn.exec_driver_sql("ALTER TABLE exam_sessions ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
+        res = await conn.exec_driver_sql(
+            "UPDATE exam_sessions SET archived = 1, decision = 'pending' WHERE decision = 'archived'")
+        log_db(f"Migration: exam_sessions.archived нэмлээ ({res.rowcount} архивласан session шилжүүлэв)")
+
     cols = {r[1] for r in (await conn.exec_driver_sql("PRAGMA table_info(risk_events)")).fetchall()}
     if "session_id" not in cols:
         await conn.exec_driver_sql("ALTER TABLE risk_events ADD COLUMN session_id INTEGER REFERENCES exam_sessions(id)")
@@ -138,7 +147,11 @@ async def _migrate(conn):
                AND risk_events.timestamp >= s.started_at
                AND (s.ended_at IS NULL OR risk_events.timestamp <= s.ended_at)
              ORDER BY s.started_at DESC LIMIT 1)
-        WHERE session_id IS NULL
+        WHERE session_id IS NULL AND EXISTS (
+            SELECT 1 FROM exam_sessions s
+             WHERE s.student_id = risk_events.student_id AND s.exam_id = risk_events.exam_id
+               AND risk_events.timestamp >= s.started_at
+               AND (s.ended_at IS NULL OR risk_events.timestamp <= s.ended_at))
     """)
     if res.rowcount:
         log_db(f"Migration: {res.rowcount} event-ийг session-д холболоо")

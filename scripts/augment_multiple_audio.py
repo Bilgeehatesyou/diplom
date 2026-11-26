@@ -12,6 +12,7 @@ acoustic pattern-ийг random offset + random weight-ээр сайн taatraда
     ffmpeg PATH-д байх
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -127,8 +128,8 @@ def main():
     print(f"📁 Talking файлууд: {len(talking_files)}")
     MULTIPLE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Хуучин augmented файлуудыг арилгах
-    old = list(MULTIPLE_DIR.glob("aug_multiple_*.webm"))
+    # Хуучин augmented файлуудыг арилгах (энэ скриптийн өөрийн үүсгэсэн aug_multiple_* л)
+    old = list(MULTIPLE_DIR.glob("*aug_multiple_*.webm"))
     if old:
         print(f"🧹 Хуучин {len(old)} augmented дээж устгаж байна...")
         for f in old:
@@ -142,21 +143,32 @@ def main():
     n_target = min(N_SAMPLES, len(all_pairs))
     print(f"🎛 {n_target} synthetic multiple-voices дээж үүсгэж байна...")
 
+    # Ижил микрофоны клипүүдийг л холино (cm_+cm_, wc_+wc_) → mic-ээр split хийх боломжтой
+    def mic(p): return p.name[:3] if p.name[:3] in ("cm_", "wc_") else ""
+    all_pairs = [(a, b) for a, b in all_pairs if mic(talking_files[a]) == mic(talking_files[b])]
+    n_target = min(N_SAMPLES, len(all_pairs))
+
+    # Manifest: mix бүр аль эх клипүүдээс үүссэн бэ → scripts/audio_split.py leakage-гүй хуваахад ашиглана
+    manifest = {}
     success = 0
     for i, (a_idx, b_idx) in enumerate(all_pairs[:n_target]):
         try:
             pcm_a = webm_to_pcm(talking_files[a_idx])
             pcm_b = webm_to_pcm(talking_files[b_idx])
             mixed = mix_audios(pcm_a, pcm_b, rng)
-            out_path = MULTIPLE_DIR / f"aug_multiple_{i:03d}.webm"
+            prefix = mic(talking_files[a_idx])
+            out_path = MULTIPLE_DIR / f"{prefix}aug_multiple_{i:03d}.webm"
             pcm_to_webm(mixed, out_path)
+            manifest[out_path.name] = [talking_files[a_idx].name, talking_files[b_idx].name]
             success += 1
             if (i + 1) % 5 == 0:
                 print(f"   {i+1}/{n_target} бэлэн")
         except Exception as e:
             print(f"   ⚠ Алдаа [{i}]: {e}")
 
-    print(f"\n✅ {success}/{n_target} дээж үүссэн: {MULTIPLE_DIR}")
+    (MULTIPLE_DIR / "aug_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"\n✅ {success}/{n_target} дээж үүссэн: {MULTIPLE_DIR} (+ aug_manifest.json)")
     print(f"\nДараа нь:")
     print(f"   python scripts/retrain_audio_classifier.py")
     print(f"\nЭсвэл Colab дээр training_data.zip-нд хамтруулж upload.")

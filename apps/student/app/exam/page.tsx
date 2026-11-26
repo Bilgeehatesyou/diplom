@@ -76,6 +76,8 @@ export default function ExamPage() {
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
   const [cameraOk, setCameraOk] = useState(false)
   const [calibrated, setCalibrated] = useState(false)
+  const [liveness, setLiveness] = useState<{ id: number; instruction: string; endsAt: number } | null>(null)
+  const [livenessLeft, setLivenessLeft] = useState(0)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [isFullscreen, setIsFullscreen] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -128,6 +130,23 @@ export default function ExamPage() {
     }
   }
 
+  // Liveness даалгаврын дохио (оюутан цаас руу харж байсан ч сонсоно)
+  const playAlert = () => {
+    try {
+      const ctx = new AudioContext()
+      ;[0, 0.2].forEach(t => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.frequency.value = 990
+        gain.gain.value = 0.12
+        osc.connect(gain).connect(ctx.destination)
+        osc.start(ctx.currentTime + t)
+        osc.stop(ctx.currentTime + t + 0.12)
+      })
+      setTimeout(() => ctx.close().catch(() => {}), 1000)
+    } catch {}
+  }
+
   // ── Бүх зүйлийг зогсоогоод шилжих ──
   const finish = useCallback((path: string) => {
     closingRef.current = true
@@ -175,6 +194,11 @@ export default function ExamPage() {
         setTimeout(() => setWarning(null), 4000)
       } else if (data.type === 'calibrated') {
         setCalibrated(true)
+      } else if (data.type === 'liveness') {
+        setLiveness({ id: data.id, instruction: data.instruction, endsAt: Date.now() + data.timeout * 1000 })
+        playAlert()
+      } else if (data.type === 'liveness_done') {
+        setLiveness(null)
       } else if (data.type === 'exam_ended') {
         finish('/done?r=time')
       } else if (data.type === 'replaced') {
@@ -431,6 +455,16 @@ export default function ExamPage() {
     }
   }, [sendEvent])
 
+  useEffect(() => {
+    if (!liveness) return
+    const t = setInterval(() => {
+      const l = Math.max(0, Math.ceil((liveness.endsAt - Date.now()) / 1000))
+      setLivenessLeft(l)
+      if (l <= 0) setLiveness(null)   // серверийн liveness_done ирэхээс өмнө хугацаа дуусвал нуух
+    }, 200)
+    return () => clearInterval(t)
+  }, [liveness])
+
   const enterFullscreen = () => {
     document.documentElement.requestFullscreen?.().catch(() => {})
   }
@@ -480,6 +514,14 @@ export default function ExamPage() {
               Бүтэн дэлгэц рүү орох
             </button>
           </div>
+        </div>
+      )}
+
+      {liveness && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[70] w-[min(560px,92vw)] rounded-xl border-2 border-blue-400 bg-blue-50 shadow-2xl px-5 py-4 text-center">
+          <p className="text-[11px] font-bold tracking-wider uppercase text-blue-600 mb-1">Камерын шалгалт · {livenessLeft}с</p>
+          <p className="text-base font-semibold text-slate-900">{liveness.instruction}</p>
+          <p className="text-xs text-slate-500 mt-1">Энэ нь бичлэг биш, амьд хүн байгааг шалгах богино даалгавар.</p>
         </div>
       )}
 

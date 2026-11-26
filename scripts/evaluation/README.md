@@ -63,7 +63,7 @@ scripts/evaluation/audio_samples/
 python scripts/evaluation/evaluate.py
 ```
 
-Үр дүн нь repo-ийн root-д `EVALUATION_REPORT.md` файл болж үүснэ. Дотор нь:
+Үр дүн нь `scripts/evaluation/results/labeled_precision_report.md` болж үүснэ (repo-ийн `EVALUATION_REPORT.md` нь гараар хөтлөгддөг нэгдсэн тайлан — автоматаар дарж бичигдэхгүй). Дотор нь:
 
 - **Vision метрик** — үйл явдал тус бүрд TP/FP/Precision
 - **Audio confusion matrix** — 4×4 бодит vs таамаг
@@ -78,7 +78,7 @@ python scripts/evaluation/evaluate.py
 1. python scripts/evaluation/label_incidents.py    # GUI-ээр зураг тэмдэглэх
 2. (audio_samples/ руу аудио хуулах)                # заавал биш
 3. python scripts/evaluation/evaluate.py            # тайлан үүсгэх
-4. EVALUATION_REPORT.md-ийг диплом ажилд хуулах
+4. results/ дахь тайлангуудаас EVALUATION_REPORT.md-ийг шинэчлэх
 ```
 
 ## Анхаар
