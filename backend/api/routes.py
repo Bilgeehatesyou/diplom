@@ -10,7 +10,8 @@ from sqlalchemy import select, func, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import issue_token, verify_password, require_student, require_teacher
-from db import get_db, RiskEvent, ExamSession, Student, Teacher, Submission
+from db import get_db, RiskEvent, ExamSession, Student, Teacher, Submission, PilotMark
+from pilot import PILOT_MODE, public_protocol, load_protocol
 from exams import DEFAULT_EXAM_ID, get_exam, public_exam
 from exam_service import (ExamError, SUBMIT_GRACE_SEC, start_or_resume, get_active_session,
                           get_submission, load_answers, save_answers, finalize_session,
@@ -97,7 +98,33 @@ async def exam_start(body: ExamStart, user=Depends(require_student), db: AsyncSe
         "answers": load_answers(sub),
         "flag_count": flag_count,
         "exam": public_exam(body.exam_id),
+        "pilot": public_protocol(),
     }
+
+
+class PilotMarkBody(BaseModel):
+    exam_id: str = DEFAULT_EXAM_ID
+    step_index: int = Field(ge=0, le=500)
+    step_id: str = Field(max_length=32)
+    skipped: bool = False
+
+
+@router.post("/pilot/mark")
+async def pilot_mark(body: PilotMarkBody, user=Depends(require_student), db: AsyncSession = Depends(get_db)):
+    """Pilot протоколын алхам эхэлснийг серверийн цагаар бүртгэнэ (ground truth)."""
+    if not PILOT_MODE:
+        raise HTTPException(404, "Pilot горим идэвхгүй")
+    protocol = load_protocol()
+    valid = {s["id"] for s in protocol["steps"]} | {"end"}
+    if body.step_id not in valid:
+        raise HTTPException(400, "Буруу алхам")
+    sess = await get_active_session(db, user["sub"], body.exam_id)
+    if sess is None:
+        raise HTTPException(409, {"code": "no_active_session", "message": "Идэвхтэй шалгалт алга"})
+    db.add(PilotMark(session_id=sess.id, protocol=protocol["id"], step_index=body.step_index,
+                     step_id=body.step_id, started_at=datetime.now(), skipped=body.skipped))
+    await db.commit()
+    return {"ok": True}
 
 
 @router.put("/exam/answers")

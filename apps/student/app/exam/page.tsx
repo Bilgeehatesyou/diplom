@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { WS, apiFetch, ApiError, getStudent, clearStudent, StudentAuth } from '../../lib/api'
+import PilotRunner, { PilotProtocol } from '../../components/PilotRunner'
 
 interface Question {
   id: number
@@ -23,6 +24,7 @@ interface StartResponse {
   answers: Record<string, string>
   flag_count: number
   exam: ExamInfo
+  pilot: PilotProtocol | null
 }
 
 const EXAM_ID = 'exam_001'
@@ -65,6 +67,7 @@ export default function ExamPage() {
 
   const [student, setStudentState] = useState<StudentAuth | null>(null)
   const [exam, setExam] = useState<ExamInfo | null>(null)
+  const [pilot, setPilot] = useState<PilotProtocol | null>(null)
   const [timeLeft, setTimeLeft] = useState(0)
   const [warning, setWarning] = useState<string | null>(null)
   const [answers, setAnswers] = useState<Record<string, string>>({})
@@ -282,6 +285,7 @@ export default function ExamPage() {
       endAtRef.current = Date.now() + data.remaining_sec * 1000
       setTimeLeft(data.remaining_sec)
       setExam(data.exam)
+      setPilot(data.pilot || null)
       setFlagCount(data.flag_count || 0)
 
       // Сервер = эх сурвалж. Сүлжээ тасарч autosave амжаагүй бол local draft-ийг сэргээнэ.
@@ -477,6 +481,10 @@ export default function ExamPage() {
             </button>
           </div>
         </div>
+      )}
+
+      {pilot && !notice && (
+        <PilotRunner protocol={pilot} examId={EXAM_ID} ready={wsStatus === 'connected'} />
       )}
 
       {notice && (

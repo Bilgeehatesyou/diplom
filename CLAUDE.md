@@ -101,6 +101,10 @@ ONLY on the server and pushed to teachers (`meta: scores`). Dedup window 10s per
 - **EBML handling:** WebM stream's EBML header is only in the first MediaRecorder chunk. Backend saves this and prepends to subsequent chunks for ffmpeg decoding. Recorder restarts on every WS reconnect to get fresh EBML.
 - **Audio classifier limitation:** WavLM model trained to 98% accuracy on phone/studio recordings but predicts `normal` for browser WebM audio (domain mismatch). Production uses VAD+RMS heuristics. Honest finding for thesis.
 
+## Pilot evaluation
+
+`PILOT_MODE=1` (backend/.env) makes `/api/exam/start` return `backend/pilot_protocol.json`; the student exam page shows `components/PilotRunner.tsx` (instructions + beeps) and posts `/api/pilot/mark` per step → `pilot_marks` table (server time = ground truth). `scripts/evaluation/pilot_report.py` matches marks to `risk_events` by session_id → per-detector recall (step-level) / precision (event-level) / F1 with Wilson CI, latency, normal-period false alarms per hour. Guide: `scripts/evaluation/PILOT_GUIDE.md`. Off by default.
+
 ## Tuning knobs
 
 - `_DEDUP_WINDOW_SEC = 10` — same event type within 10s ignored

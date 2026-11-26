@@ -46,6 +46,10 @@ Docker: `SECRET_KEY=... docker-compose up`
 3. Хариулт автоматаар серверт хадгалагдана (`PUT /api/exam/answers`); refresh, дахин нэвтрэх, сүлжээ тасрах нь оноо/таймерыг reset хийхгүй.
 4. `POST /api/exam/submit` эсвэл хугацаа дуусахад сервер session-ийг хаана. Илгээсэн шалгалтыг дахин өгөхийн тулд багш "Цэвэрлэх" хийнэ.
 
+## Pilot үнэлгээ
+`backend/.env`-д `PILOT_MODE=1` тавьж туршилт хийнэ — дэлгэрэнгүйг `scripts/evaluation/PILOT_GUIDE.md`.
+Детектор бүрийн Recall / Precision / F1, хоцролт, цагт ногдох худал дохиоллыг `scripts/evaluation/pilot_report.py` гаргана.
+
 ## Хяналтын event-үүд
 | Event | Түвшин | Эх сурвалж |
 |---|---|---|

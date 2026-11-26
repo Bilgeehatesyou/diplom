@@ -88,6 +88,18 @@ class Submission(Base):
     auto_submitted : Mapped[bool]          = mapped_column(Boolean, default=False)
 
 
+class PilotMark(Base):
+    """Pilot үнэлгээний протоколын алхам бүрийн эхлэх цаг (серверийн цаг) — ground truth."""
+    __tablename__ = "pilot_marks"
+    id         : Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id : Mapped[int]      = mapped_column(ForeignKey("exam_sessions.id"), index=True)
+    protocol   : Mapped[str]      = mapped_column(String(32))
+    step_index : Mapped[int]      = mapped_column(Integer)
+    step_id    : Mapped[str]      = mapped_column(String(32))     # "end" = протокол дууссан
+    started_at : Mapped[datetime] = mapped_column(DateTime)
+    skipped    : Mapped[bool]     = mapped_column(Boolean, default=False)
+
+
 async def _migrate(conn):
     """Хуучин aiproctor.db-г шинэ schema руу шилжүүлэх (SQLite, idempotent)."""
     if not DATABASE_URL.startswith("sqlite"):
